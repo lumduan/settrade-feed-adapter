@@ -1,0 +1,44 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
+
+# Testing
+.pytest_cache/
+
+# Type checking and caching
+.mypy_cache/
+.ruff_cache/
+.uff_cache/
+
+# AI tools
+.claude/
+
+# Environment
+.env
+.env.local
+
+# GitHub prompts (private)
+.github/instructions/
+.github/prompts/
+.github/copilot-instructions.md
+
+# Planning documents (private)
+docs/plan/
