@@ -3,7 +3,7 @@
 **Feature:** Low-Latency MQTT Feed Adapter for Settrade Open API
 **Branch:** `feature/mqtt-feed-adapter`
 **Created:** 2026-02-12
-**Status:** In Progress (Phase 2 Complete)
+**Status:** In Progress (Phase 3 Complete)
 
 ---
 
@@ -381,15 +381,34 @@ stateDiagram-v2
 
 ---
 
-### Phase 3: Dispatcher & Event Queue
+### Phase 3: Dispatcher & Event Queue — Complete (2026-02-13)
 
-**Tasks:**
-- Implement `Dispatcher` in `core/dispatcher.py`
-- Backed by `collections.deque(maxlen=100_000)`
-- `push(event)` — append to deque (called from MQTT thread)
-- `poll(max_events=100)` — popleft up to N events (called from strategy thread)
-- Non-blocking: return empty list if no events
-- Track statistics: `total_pushed`, `total_polled`, `total_dropped`
+**Branch:** `feature/phase3-dispatcher`
+**Plan:** `docs/plan/low-latency-mqtt-feed-adapter/phase3-dispatcher.md`
+
+**Deliverables:**
+
+- `core/dispatcher.py` — `Dispatcher[T]` (generic), `DispatcherConfig`, `DispatcherStats` with push/poll/clear/stats
+- `core/__init__.py` — Updated package exports
+- `tests/test_dispatcher.py` — 51 unit tests, all passing, 100% coverage
+
+**Key design decisions:**
+
+- `collections.deque(maxlen=100_000)` for automatic drop-oldest backpressure
+- Pre-check drop detection (`len() == maxlen` before `append()`) leveraging deque(maxlen) eviction guarantee
+- Lock-free stats — no `_counter_lock` since each counter is single-writer and CPython int reads are atomic
+- Optimised poll loop — bounded `for` with truthiness break (no exception control flow, no `len(events)` per iteration)
+- Generic `Dispatcher[T]` with `TypeVar` for type-safe usage at adapter and strategy layers
+- `clear()` method for MQTT reconnection, trading halts, and error recovery
+- `_invariant_ok()` for test-time consistency verification: `total_pushed - total_dropped - total_polled == queue_len`
+- Eventually-consistent stats (not transactional) — documented explicitly
+- Strictly SPSC (single-producer, single-consumer) — documented as non-negotiable constraint
+
+**Issues encountered:**
+
+1. Drop detection race: initial post-append `prev_len` check had potential overcount under SPSC. Switched to pre-check pattern.
+2. Stats lock removal: `_counter_lock` only prevented two `stats()` calls from colliding — removed entirely since counters are single-writer.
+3. Poll loop optimisation: replaced `while` with `len(events)` per-iteration check with bounded `for` loop.
 
 ---
 
