@@ -3,7 +3,7 @@
 **Feature:** Low-Latency MQTT Feed Adapter for Settrade Open API
 **Branch:** `feature/mqtt-feed-adapter`
 **Created:** 2026-02-12
-**Status:** In Progress (Phase 1 Complete)
+**Status:** In Progress (Phase 2 Complete)
 
 ---
 
@@ -347,27 +347,37 @@ stateDiagram-v2
 
 ---
 
-### Phase 2: Adapter for BidOffer
+### Phase 2: Adapter for BidOffer — Complete (2026-02-13)
 
-**Tasks:**
-- Implement `BidOfferAdapter` in `infra/settrade_adapter.py`
-- Subscribe to topic `proto/topic/bidofferv3/{symbol}`
-- Parse binary with `BidOfferV3().parse(payload)` from `settrade_v2.pb.bidofferv3_pb2`
-- Extract fields directly: `msg.bid_price1.units`, `msg.bid_price1.nanos`, etc.
-- Convert `Money` → `float` via `units + nanos * 1e-9` (no Decimal)
-- Create `BestBidAsk` dataclass with `recv_ts = time.time_ns()`
-- Push to dispatcher via `deque.append()`
+**Branch:** `feature/phase2-bidoffer-adapter`
+**Plan:** `docs/plan/low-latency-mqtt-feed-adapter/phase2-bidoffer-adapter.md`
 
-**Protobuf Field Map (from SDK analysis):**
-```
-BidOfferV3 fields:
-  symbol: str
-  bid_flag / ask_flag: BidAskFlag (NORMAL=1, ATO=2, ATC=3)
-  bid_price1..10: Money (units: int, nanos: int)
-  ask_price1..10: Money (units: int, nanos: int)
-  bid_volume1..10: int
-  ask_volume1..10: int
-```
+**Deliverables:**
+
+- `core/events.py` — Pydantic event models: `BestBidAsk`, `FullBidOffer`, `BidAskFlag(IntEnum)`
+- `core/__init__.py` — Core package with public exports
+- `infra/settrade_adapter.py` — `BidOfferAdapter` with protobuf parsing, dual event modes, rate-limited logging
+- `infra/__init__.py` — Updated package exports
+- `tests/test_events.py` — 32 unit tests for event models (immutability, validation, model_construct bypass, deep immutability, hashability)
+- `tests/test_settrade_adapter.py` — 41 unit tests for adapter (parsing, error isolation, rate-limited logging, stats, end-to-end)
+
+**Key design decisions:**
+
+- Pydantic `BaseModel(frozen=True)` with `model_construct()` in hot path (project standard compliance, zero validation overhead)
+- Separated error isolation: `parse_errors` vs `callback_errors` in distinct try/except blocks
+- Lock-free hot-path counters (GIL-atomic `+= 1`), lock only in `stats()` for consistent reads
+- Dual timestamps: `time.time_ns()` (wall clock) + `time.perf_counter_ns()` (monotonic)
+- Explicit field unroll for FullBidOffer (no `getattr`/f-string in hot path)
+- Callback-based event forwarding (decoupled from Phase 3 dispatcher)
+- Rate-limited logging: first N errors with exception trace, then every Nth
+- `_sub_lock` protects `_subscribed_symbols` set for thread-safe stats reads
+- Float precision contract: downstream must use tolerance comparison, not equality
+- Protobuf instance reuse deferred (documented as future optimization)
+
+**Issues encountered:**
+
+1. PLAN.md specified `@dataclass(slots=True)` but project standard requires Pydantic — resolved with `model_construct()` for hot-path performance
+2. `logging.exception()` in hot path would spam logs at high error rates — implemented rate-limited logging immediately rather than deferring to Phase 5
 
 ---
 
