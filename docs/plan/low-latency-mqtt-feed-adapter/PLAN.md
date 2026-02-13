@@ -412,12 +412,194 @@ stateDiagram-v2
 
 ---
 
-### Phase 4: Examples & Scripts
+### Phase 4: Benchmark & Performance Validation
+
+**Branch:** `feature/phase4-benchmark-validation`
+**Plan:** `docs/plan/low-latency-mqtt-feed-adapter/phase4-benchmark-validation.md`
+
+**Purpose:**
+
+This phase proves the core value proposition: **"Significantly reducing latency from the SDK path."**
+
+Without clear benchmark data against the official SDK, the project cannot demonstrate its performance claims. For trading infrastructure, numbers matter more than architectural elegance.
+
+**Deliverables:**
+
+- `scripts/benchmark_utils.py` — Shared utilities: latency collection, percentile calculation, statistics formatting
+- `scripts/benchmark_sdk.py` — SDK baseline: measure `settrade_v2.realtime` parse latency, CPU, GC pressure
+- `scripts/benchmark_adapter.py` — Adapter benchmark: measure custom adapter parse latency, CPU, GC pressure
+- `scripts/benchmark_compare.py` — Comparison report generator with formatted table output
+- `examples/example_bidoffer.py` — Real-world usage example with latency measurement
+- `README.md` — Add benchmark results table and performance claims
+
+**Benchmark Goals:**
+
+1. **Latency Distribution** — Measure P50, P95, P99 percentiles for parse + normalize path
+2. **CPU Usage** — Measure average CPU utilization during sustained message flow
+3. **GC Pressure** — Measure generation-0 collection count as proxy for allocation rate
+4. **Message Throughput** — Verify no message loss or drops under normal load
+5. **Drop Rate** — Measure queue overflow rate under backpressure scenarios
+6. **Fair Comparison** — Both SDK and adapter must have identical workload (same symbol, same duration, same processing)
+
+**Benchmark Architecture:**
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Process A: SDK Baseline                            │
+│  ├─ settrade_v2.realtime.RealtimeDataConnection     │
+│  ├─ Subscribe bidofferv3/AOT                        │
+│  ├─ Measure: t0 = on_message entry                  │
+│  ├─         t1 = after .to_dict()                   │
+│  └─ Collect: (t1 - t0) latencies                    │
+│                                                     │
+│  Process B: Adapter Benchmark                       │
+│  ├─ SettradeMQTTClient + BidOfferAdapter            │
+│  ├─ Subscribe bidofferv3/AOT                        │
+│  ├─ Measure: t0 = on_message entry                  │
+│  ├─         t1 = after dataclass creation           │
+│  └─ Collect: (t1 - t0) latencies                    │
+│                                                     │
+│  Run both for 60-120 seconds in sandbox             │
+│  Calculate percentiles, CPU avg, GC count           │
+│  Generate comparison table                          │
+└─────────────────────────────────────────────────────┘
+```
+
+**Measurement Strategy:**
+
+| Metric | Measurement Method | Tool |
+|---|---|---|
+| Parse latency | `time.perf_counter_ns()` at entry and exit of parse path | `t1 - t0` per message |
+| Percentiles | Calculate P50, P95, P99 from collected latencies | `numpy.percentile()` |
+| CPU usage | Sample CPU percentage every 1 second during run | `psutil.Process().cpu_percent(interval=1)` |
+| GC pressure | Sample generation-0 count every 5 seconds | `gc.get_count()[0]` |
+| Throughput | Count messages received over benchmark duration | `total_messages / duration_seconds` |
+
+**Critical Design Constraints:**
+
+1. **Fair Comparison** — Both paths must:
+   - Subscribe to the same symbol (e.g., AOT)
+   - Run for the same duration (60-120 seconds)
+   - Process messages identically (no print in one but not the other)
+   - Measure only the parse path we control (not broker → client network latency)
+
+2. **Measurement Scope** — Measure **only** parse + normalize cost:
+   - ❌ Do NOT measure end-to-end (broker → strategy) — network latency is uncontrollable
+   - ✅ DO measure on_message entry → normalized event created
+   - This isolates the performance delta we actually own
+
+3. **Environment Consistency** — Benchmark on production-like environment:
+   - ❌ Do NOT benchmark on macOS (different GIL, scheduler, CPU architecture)
+   - ✅ DO benchmark on Linux VM or Docker container matching production
+   - Rationale: GIL behavior, thread scheduling, and CPU optimizations differ significantly
+
+4. **Statistical Validity** — Collect sufficient samples:
+   - Minimum 1,000 messages per benchmark run
+   - Warm-up period: discard first 100 messages from statistics
+   - Multiple runs: average results over 3-5 runs to reduce variance
+
+**Expected Performance Targets:**
+
+Based on architectural improvements (no thread spawn, no `.to_dict()`, no `Decimal`, no locks):
+
+| Metric | SDK Baseline (est.) | Adapter Target | Improvement Target |
+|---|---|---|---|
+| P50 latency | ~120-150us | ~30-50us | **3-4x faster** |
+| P95 latency | ~250-350us | ~60-90us | **3-5x faster** |
+| P99 latency | ~400-600us | ~100-150us | **3-6x faster** |
+| Avg CPU | ~35-50% | ~15-25% | **40-60% reduction** |
+| GC gen-0 | ~1,200-1,500 | ~150-300 | **80-90% reduction** |
+
+**Example Benchmark Output:**
+
+```
+==================================================================
+BENCHMARK RESULTS — Settrade Feed Adapter vs Official SDK
+==================================================================
+Environment:  Linux 5.15 (Docker), CPython 3.11.7, 4 vCPU
+Symbol:       AOT (Settrade Sandbox)
+Duration:     120 seconds
+Messages:     SDK: 18,432 | Adapter: 18,427
+==================================================================
+
+Metric                    SDK          Adapter      Improvement
+------------------------------------------------------------------
+P50 latency (us)          145          42           3.45x faster
+P95 latency (us)          310          80           3.87x faster
+P99 latency (us)          510          120          4.25x faster
+Avg CPU (%)               42%          18%          -57%
+GC Gen-0 count            1,420        210          -85%
+Dropped messages          0            0            —
+
+==================================================================
+CONCLUSION
+==================================================================
+Adapter reduces parse latency by 3-4x and CPU usage by ~50%.
+GC pressure reduced by 85%, indicating minimal heap allocation.
+No message loss observed under normal load.
+
+Adapter is production-ready for low-latency trading infrastructure.
+==================================================================
+```
+
+**Files to Create:**
+
+```
+scripts/
+├── benchmark_utils.py      # Shared: timing, percentiles, formatting, GC/CPU sampling
+├── benchmark_sdk.py        # SDK baseline: instrument settrade_v2.realtime callback
+├── benchmark_adapter.py    # Adapter: instrument BidOfferAdapter callback
+└── benchmark_compare.py    # Run both, collect stats, print comparison table
+
+examples/
+└── example_bidoffer.py     # Usage example with inline latency measurement
+```
+
+**Integration with README:**
+
+Phase 4 must update `README.md` with:
+
+- Performance comparison table (paste benchmark output)
+- Clear statement: "3-4x lower latency than official SDK"
+- Link to benchmark scripts for reproducibility
+- Environment notes (Linux VM, Docker recommended)
+
+**Advanced: Shadow Mode Testing (Optional)**
+
+For correctness validation, run SDK + Adapter simultaneously on same symbol:
+
+```python
+# Assert parsed values match within tolerance
+assert abs(sdk_event.bid - adapter_event.bid) < 1e-6
+assert abs(sdk_event.ask - adapter_event.ask) < 1e-6
+```
+
+This proves adapter produces identical results, not just faster parsing.
 
 **Tasks:**
-- Add example script for bid/offer subscription in `examples/example_bidoffer.py`
-- Add latency measurement example
-- Provide readme usage examples
+
+- [ ] Create `scripts/benchmark_utils.py` — Timing utilities, percentile calculation, stats formatting
+- [ ] Create `scripts/benchmark_sdk.py` — Instrument official SDK with latency measurement
+- [ ] Create `scripts/benchmark_adapter.py` — Instrument custom adapter with latency measurement
+- [ ] Create `scripts/benchmark_compare.py` — Run both benchmarks, generate comparison report
+- [ ] Create `examples/example_bidoffer.py` — Real-world usage example with error handling
+- [ ] Run 60-120 second sandbox benchmark on Linux VM
+- [ ] Document benchmark methodology in `docs/`
+- [ ] Add benchmark results table to `README.md`
+- [ ] Verify >= 3x improvement in P99 latency vs SDK
+- [ ] Document CPU and GC profile improvements
+- [ ] Optional: Implement shadow mode correctness test
+
+**Quality Gates:**
+
+- [ ] Benchmark runs successfully in sandbox environment
+- [ ] P99 latency improvement >= 3x vs SDK
+- [ ] CPU usage reduction >= 40% vs SDK
+- [ ] GC pressure reduction >= 70% vs SDK
+- [ ] Zero message loss during benchmark
+- [ ] Results reproducible across 3+ runs (variance < 15%)
+- [ ] Benchmark scripts documented and executable by third parties
+- [ ] README updated with performance claims and proof
 
 ---
 
@@ -683,16 +865,33 @@ for event in dispatcher.poll():
 
 ## Success Criteria
 
+### Functional Requirements
+
 - Adapter connects to Settrade broker successfully via WSS.
-- Events parsed & normalized correctly (field values match SDK output).
+- Events parsed & normalized correctly (field values match SDK output within floating-point tolerance).
 - No dict conversion, no thread spawn, no Decimal in hot path.
-- Parse + normalize latency < 200us (P99).
 - Dispatcher queue accessible for strategy consumption.
 - Auto-reconnect recovers within 30 seconds.
 - Token refresh works before expiration.
 - Example scripts work in sandbox environment.
-- Latency benchmarks documented and compared with SDK.
 - Observability stats accessible via `dispatcher.stats()` and `mqtt_client.stats()`.
+
+### Performance Requirements (Non-Negotiable)
+
+- **Parse + normalize latency < 200us (P99)** — Hard requirement from architecture
+- **Adapter demonstrates >= 3x lower P99 parse latency vs SDK** — Core value proposition
+- **CPU usage reduction >= 40% vs SDK** — Proof of reduced overhead
+- **GC pressure reduction >= 70% vs SDK** — Proof of allocation elimination
+- **Zero message loss under normal load** — Reliability requirement
+- **Benchmark results documented in README.md** — Transparency requirement
+
+### Testing Requirements
+
+- All unit tests pass (`pytest tests/ -v`)
+- Integration tests pass in sandbox environment
+- Benchmark runs complete successfully (60+ seconds, 1000+ messages)
+- Benchmark results reproducible (variance < 15% across 3+ runs)
+- Shadow mode test (if implemented) shows SDK and adapter produce equivalent results
 
 ---
 
