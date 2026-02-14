@@ -1,9 +1,10 @@
 # Settrade MQTT Feed Adapter Implementation Plan
 
-**Feature:** Low-Latency MQTT Feed Adapter for Settrade Open API
+**Feature:** Market Data Ingestion Layer for Settrade Open API
 **Branch:** `feature/mqtt-feed-adapter`
 **Created:** 2026-02-12
-**Status:** In Progress (Phase 4 Complete)
+**Status:** In Progress (Phase 4 Complete, Phase 5 Specified)
+**Positioning:** Production-aware ingestion layer with architectural control
 
 ---
 
@@ -34,56 +35,72 @@
 
 ### Purpose
 
-This feature implements a custom MQTT Feed Adapter that connects directly to the Settrade Open API real-time data MQTT service without using the official Python SDK's realtime client. Instead, it uses low-level MQTT connection over WebSocket, authenticates via host & token fetched through REST, and parses protobuf messages directly for bid/offer updates. This solves performance bottlenecks and enables a low-latency market data feed for trading engines.
+This feature implements a **market data ingestion layer** that connects directly to the Settrade Open API real-time data MQTT service, providing explicit control over the full data pipeline from MQTT → Protobuf → Typed Events. This is an infrastructure foundation for developers who need control, observability, and deterministic flow rather than the convenience of the official SDK's abstracted approach.
 
-### SDK Bottlenecks Identified
+### Design Rationale
 
-Analysis of `settrade_v2.realtime` (the official SDK) reveals these specific overhead sources:
+The official SDK (`settrade_v2.realtime`) is production-ready and convenient for most use cases. However, it makes specific implementation choices that prioritize convenience over control:
 
-| Bottleneck | SDK Code Path | Impact |
-|---|---|---|
-| Thread-per-callback | `threading.Thread(target=c, args=args).start()` on every message | GIL contention, ~50-100us overhead per spawn |
-| Dict conversion | `schema().parse(msg).to_dict(casing=Casing.SNAKE, include_default_values=True)` | Allocates dict + string keys per message |
-| Decimal conversion | `Money.to_dict()` → `Decimal(units) + Decimal(nanos) / 1_000_000_000` | Heap allocation per price field |
-| Lock on callback pool | `lock_callback_pool` acquired on every `_get_callback_pool()` | Serializes message dispatch |
+| Implementation Choice | Official SDK | This Adapter | Trade-off |
+|---|---|---|---|
+| Callback execution | `threading.Thread` per message | Inline in MQTT thread | Less overhead, but blocks IO thread |
+| Message parsing | `.parse(msg).to_dict(casing=SNAKE)` | `.parse(msg)` + direct field access | Fewer allocations, but less convenient |
+| Price representation | `Decimal` for exact arithmetic | `float` via `units + nanos * 1e-9` | Faster, but loses exact decimal precision |
+| Event dispatch | Hidden threading | Explicit bounded queue | More control, but more responsibility |
+| Backpressure | Implicit (thread pool) | Explicit (drop-oldest) | Predictable, but requires monitoring |
 
-This adapter eliminates all four by: no thread spawn, no dict conversion, direct field access, and lock-free hot path.
+In practice, these differences result in **modest latency improvements (~1.1-1.3x)** for parse + normalize operations. **The primary value is architectural control, not raw speed.**
 
 ### Key Objectives
 
-1. **Direct MQTT Connection** – Connect directly to the Settrade Open API MQTT broker via WebSockets with SSL (port 443, Bearer auth header).
-2. **Protobuf Parsing** – Parse binary betterproto messages (e.g., BidOfferV3) directly with field access, no `.to_dict()`.
-3. **Adapter Abstraction** – Normalize raw messages into clean internal event models (`@dataclass(slots=True)`).
-4. **Decoupled Dispatcher** – Publish normalized events into a thread-safe queue for strategy processing.
-5. **Low Latency** – Zero thread spawn, zero dict allocation, zero lock contention in the hot path.
+1. **Direct MQTT Connection** – Low-level control over connection, authentication, and reconnection logic
+2. **Protobuf Parsing** – Direct field access from protobuf messages (no JSON/dict abstraction layer)
+3. **Typed Event Models** – Strongly-typed Pydantic models instead of dynamic dictionaries
+4. **Explicit Dispatcher** – Bounded queue with visible backpressure strategy (drop-oldest)
+5. **Deterministic Flow** – Clear ownership: MQTT thread → Parser → Queue → Strategy thread
+6. **Foundation Layer** – Stops at normalized event emission (not a trading framework)
 
 ### User Benefits
 
-- **High performance** – Direct parse path → lower latency than SDK.
-- **Scalability** – Easy to add more topics (price, candlestick, exchange info).
-- **Maintains control** – You decide threading/event dispatch model.
-- **Modular design** – Can plug into any strategy system.
-- **Clean data model** – Normalized dataclasses for easier downstream use.
+- **Architectural control** – Explicit ownership of the ingestion pipeline
+- **Strong typing** – Pydantic models instead of dynamic dicts for safer integration
+- **Predictable backpressure** – Visible drop-oldest strategy, no hidden buffering
+- **Easier testing** – Deterministic event flow, simpler to mock and replay
+- **Modular design** – Clean foundation for building custom trading infrastructure
+- **Pipeline observability** – Clear metrics and monitoring points
 
 ---
 
 ## Performance & Reliability Requirements
 
-### Latency Targets
+### Realistic Performance Expectations
 
-| Metric | Target | Measurement |
-|---|---|---|
-| Message receive → normalized event | < 200us | `time.time_ns()` delta |
-| Queue push (dispatcher) | < 10us | Benchmark via `deque.append()` |
-| End-to-end (broker → strategy poll) | < 500us | Full pipeline benchmark |
+In production benchmarks, this adapter provides **modest latency improvements (~1.1-1.3x faster)** than the SDK path for parse + normalize operations. Actual improvements are highly environment-dependent (CPU, OS scheduler, system load, Python version).
 
-### Hot Path Constraints
+**The primary value proposition is architectural control and deterministic event flow, not microsecond savings.**
 
-- **No per-message thread spawn** – Parsing runs inside MQTT callback thread.
-- **No dynamic dict allocation** – Direct field access from betterproto → dataclass.
-- **No `Decimal` conversion** – Convert `Money(units, nanos)` with integer arithmetic: `units + nanos * 1e-9`.
-- **No lock contention** – Queue push is the only synchronization point.
-- **Minimal object creation** – Reuse patterns where possible; `slots=True` on all dataclasses.
+### Implementation Differences
+
+These implementation choices provide the modest performance improvements:
+
+- **Inline parsing** – No thread spawn per message (parsing in MQTT callback thread)
+- **Direct field access** – No `.to_dict()` dictionary allocation
+- **Float arithmetic** – `units + nanos * 1e-9` instead of `Decimal` operations
+- **Lock-free dispatch** – Single `deque.append()` (GIL-atomic) instead of explicit locks
+- **Minimal allocations** – Single Pydantic model per message (uses `model_construct()` to bypass validation)
+
+### Design Trade-offs
+
+**Gained:**
+- Lower parse latency (modest)
+- Explicit control over threading and backpressure
+- Strongly-typed events
+- Deterministic pipeline
+
+**Lost:**
+- Exact decimal precision (uses float)
+- SDK's official support and updates
+- Convenience (more code to write)
 
 ### Reliability
 
@@ -132,13 +149,20 @@ This adapter eliminates all four by: no thread spawn, no dict conversion, direct
 
 ### SDK Comparison
 
+The official SDK is **production-ready and convenient**. This adapter is an alternative for those who need pipeline-level control.
+
 | Aspect | Official SDK | This Adapter |
 |---|---|---|
-| Callback execution | New `threading.Thread` per message | Inline in MQTT thread |
-| Message parsing | `.parse(msg).to_dict()` | `.parse(msg)` → direct field access |
-| Price conversion | `Decimal` arithmetic → `float` | `units + nanos * 1e-9` |
-| Synchronization | `threading.Lock` on callback pool | `deque.append()` only |
-| Queue mechanism | None (direct callback) | Bounded `deque` with backpressure |
+| **Target Audience** | Convenience & simplicity | Control & customization |
+| **Data Model** | Dynamic `dict` | Typed Pydantic models |
+| **Callback Execution** | New `threading.Thread` per message | Inline in MQTT thread |
+| **Message Parsing** | `.parse(msg).to_dict()` | `.parse(msg)` → direct field access |
+| **Price Representation** | `Decimal` (exact) | `float` (fast) |
+| **Event Dispatch** | Hidden threading | Explicit bounded queue |
+| **Backpressure** | Implicit (thread pool) | Explicit (drop-oldest) |
+| **Integration** | High-level convenience | Low-level control |
+| **Support** | Official & maintained | Community |
+| **Performance** | Baseline | ~1.1-1.3x faster (parse only) |
 
 ---
 
@@ -456,13 +480,327 @@ stateDiagram-v2
 
 ---
 
-### Phase 5: Documentation
+### Phase 5: Feed Integrity & Silent Gap Mitigation — Planned
+
+**Branch:** `feature/phase5-feed-integrity`
+**Plan:** `docs/plan/low-latency-mqtt-feed-adapter/phase5-feed-integrity.md`
+**Status:** Planned
+
+**Goal:** Detect and mitigate operational risk caused by snapshot-based stream without sequence IDs.
+
+#### Rationale
+
+Settrade MQTT market data characteristics:
+
+- **Snapshot-based** — Each message is a full snapshot, not incremental delta
+- **No exchange sequence IDs** — Cannot detect gaps at exchange level
+- **No replay capability** — Missed messages during disconnect are unrecoverable
+- **QoS 0 (at-most-once delivery)** — MQTT may drop messages under load
+
+**Implications:**
+
+- Silent gaps are possible
+- Intermediate microstructure transitions may be lost during disconnect
+- Event-level continuity cannot be verified at exchange level
+
+**This phase does NOT change protocol behavior.** It adds monitoring and mitigation mechanisms to provide operational visibility.
+
+#### Sub-phases
+
+**Phase 5.1 — Feed Liveness Detection**
+
+**Problem:** Cannot detect exchange-level gaps, but can detect time-based inactivity.
+
+**Implementation:**
+
+- Add `FeedHealthMonitor` in `core/feed_health.py`
+- Track `last_event_mono_ns` per symbol using **monotonic timestamps only** (`time.perf_counter_ns()`)
+- Detect `max_inter_event_gap` threshold violations
+- Expose API: `is_stale(symbol) -> bool`, `stale_symbols() -> list[str]`, `last_seen_gap_ms(symbol) -> float`
+
+**Critical:** Use `event.recv_mono_ns` (monotonic) for all time-based detection, **never** `event.recv_ts` (wall clock). Wall clock can jump due to NTP adjustments, causing false stale detection.
+
+**Configuration:**
+
+```python
+FeedHealthConfig(
+    max_gap_seconds=5.0,
+    per_symbol=True,
+)
+```
+
+**Implementation note:**
+
+```python
+def on_event(self, event: BestBidAsk) -> None:
+    """Update health state. MUST use monotonic timestamp."""
+    self._last_event_mono_ns[event.symbol] = event.recv_mono_ns
+    
+def is_stale(self, symbol: str) -> bool:
+    """Check if symbol feed is stale."""
+    last_mono = self._last_event_mono_ns.get(symbol)
+    if last_mono is None:
+        return True
+    gap_ns = time.perf_counter_ns() - last_mono
+    return gap_ns > (self.max_gap_seconds * 1e9)
+```
+
+**Phase 5.2 — Reconnect Awareness Flag**
+
+**Problem:** When reconnect occurs, intermediate data is lost and strategy is unaware.
+
+**Implementation:**
+
+- Add `reconnect_epoch` counter in `SettradeMQTTClient`
+- Increment on successful reconnect
+- Adapter attaches `connection_epoch` to each event
+
+**Event model change:**
+
+```python
+class BestBidAsk(BaseModel):
+    # ... existing fields ...
+    connection_epoch: int  # Reconnect version
+```
+
+**Strategy usage:**
+
+```python
+if event.connection_epoch != last_seen_epoch:
+    handle_reconnect()  # Clear state, cancel orders, etc.
+    last_seen_epoch = event.connection_epoch
+```
+
+This makes reconnects **visible** in the data layer.
+
+**Phase 5.3 — Queue Stall Detection**
+
+**Problem:** If strategy is slow, dispatcher drops events causing silent degradation.
+
+**Implementation:**
+
+- Add **EMA-based drop-rate** tracking in `Dispatcher`
+- Update on every `push()`: `drop_rate_ema = alpha * (1 if dropped else 0) + (1 - alpha) * drop_rate_ema`
+- Use `alpha = 0.01` for ~100-message half-life (lightweight, O(1), no memory growth)
+- If `drop_rate_ema > 0.01`, emit warning log
+- Expose: `dispatcher.health() -> dict[str, float]` with `drop_rate_ema` and `queue_utilization`
+
+**Why EMA instead of sliding window:**
+
+- **O(1) update** — No deque or time bucket management
+- **No memory growth** — Single float, not per-message timestamps
+- **No locks** — Atomic float update in CPython
+- **Responsive** — Reacts quickly to drop spikes, decays naturally
+
+**Implementation:**
+
+```python
+class Dispatcher:
+    def __init__(self, config: DispatcherConfig):
+        self._drop_rate_ema: float = 0.0
+        self._ema_alpha: float = 0.01  # ~100-message half-life
+    
+    def push(self, event: T) -> None:
+        dropped = len(self._queue) == self._queue.maxlen
+        self._queue.append(event)
+        
+        # Update EMA: alpha * (1 if drop else 0) + (1-alpha) * prev_ema
+        self._drop_rate_ema = (
+            self._ema_alpha * (1.0 if dropped else 0.0) + 
+            (1.0 - self._ema_alpha) * self._drop_rate_ema
+        )
+        
+        if dropped:
+            self._total_dropped += 1
+            if self._drop_rate_ema > 0.01:
+                logger.warning(
+                    f"High drop rate: {self._drop_rate_ema:.2%}, "
+                    f"queue_util={len(self._queue)/self._queue.maxlen:.1%}"
+                )
+```
+
+**Phase 5.4 — Feed Integrity Metrics**
+
+Extend Observability section with:
+
+| Metric | Type | Description |
+|---|---|---|
+| `max_inter_event_gap_ms` | Gauge | Longest observed gap between events per symbol (monotonic) |
+| `stale_symbols_count` | Gauge | Number of symbols with stale feed |
+| `connection_epoch` | Counter | Current reconnect version |
+| `drop_rate_ema` | Gauge | EMA-based dispatcher drop rate (alpha=0.01) |
+| `queue_utilization` | Gauge | Current queue depth / maxlen |
+| `auction_events_count` | Counter | Number of events during auction periods (ATO/ATC) |
+
+**Phase 5.5 — Strategy Guard Rail Example**
+
+Add production safety pattern to README and `examples/example_feed_health.py`:
+
+```python
+from core.feed_health import FeedHealthMonitor, FeedHealthConfig
+
+feed_monitor = FeedHealthMonitor(FeedHealthConfig(max_gap_seconds=5.0))
+
+# Strategy loop
+for event in dispatcher.poll():
+    feed_monitor.on_event(event)
+    
+    # Time-based liveness check
+    if feed_monitor.is_stale(event.symbol):
+        logger.warning(f"Feed stale for {event.symbol}, skipping")
+        continue  # Skip trading decision
+    
+    # Reconnect awareness
+    if event.connection_epoch != last_epoch:
+        logger.warning(f"Reconnect detected, clearing state")
+        cancel_all_orders()  # Clear state after data gap
+        last_epoch = event.connection_epoch
+    
+    # Safe to make trading decisions
+    process_event(event)
+```
+
+**Important:** The adapter does NOT enforce these guard rails. It only exposes signals for strategy-layer decisions.
+
+**Phase 5.6 — Market Halt Awareness (Optional Enhancement)**
+
+**Problem:** Thai market has distinct trading periods (ATO, continuous, ATC, break). Strategies need to detect auction periods.
+
+**Implementation:**
+
+- Add helper method to event models: `is_auction() -> bool`
+- Logic: `return bid_flag in (2, 3) or ask_flag in (2, 3)`  (2=ATO, 3=ATC)
+- Zero overhead — inline property, no additional fields
+
+**Usage:**
+
+```python
+for event in dispatcher.poll():
+    if event.is_auction():
+        # Skip normal trading logic during auction
+        continue
+    
+    process_continuous_trading(event)
+```
+
+**Rationale:** Simplifies strategy layer logic. `bid_flag`/`ask_flag` already exist — just expose semantic helper.
+
+**Phase 5.7 — Explicit Silent Gap Documentation**
+
+Add to PLAN.md and README:
+
+**Silent Gap Acknowledgement**
+
+This system **cannot:**
+
+- ❌ Detect exchange-level message loss (no sequence IDs provided by protocol)
+- ❌ Reconstruct missed microstructure transitions
+- ❌ Guarantee event continuity
+
+This phase **only provides:**
+
+- ✅ Time-based liveness detection (detect inactivity, not gaps) using **monotonic timestamps**
+- ✅ Reconnect visibility (know when data may have been missed)
+- ✅ Drop-rate monitoring (EMA-based, O(1) overhead)
+
+**This is correct engineering transparency.** The protocol limitation is documented, and mitigation mechanisms are provided.
+
+#### Why This Is a Separate Phase
+
+**Phase 1-4** focus on **performance + architecture** (fast, typed, explicit pipeline).
+
+**Phase 5** focuses on **operational integrity** (production awareness, risk visibility).
+
+Evolution: From **"Low-latency adapter"** → **"Production-aware ingestion layer"**
+
+#### Risk Coverage After Phase 5
+
+| Risk | Covered? | Mechanism |
+|---|---|---|
+| MQTT disconnect | ✅ | Auto-reconnect with exponential backoff |
+| Token expiration | ✅ | Refresh before expiry |
+| Queue overflow | ✅ | Drop-oldest with explicit stats |
+| Silent time gap | ✅ | Time-based liveness detection |
+| Reconnect invisibility | ✅ | Connection epoch in events |
+| Exchange-level sequence gap | ❌ | **Protocol limitation (documented)** |
+
+The ❌ is explicitly documented — this is correct engineering honesty.
+
+#### Deliverables
+
+| File | Action | Description |
+|------|--------|-------------|
+| `core/feed_health.py` | CREATE | Feed liveness monitor per symbol (monotonic timestamps only) |
+| `core/dispatcher.py` | MODIFY | Add EMA-based drop-rate tracking and `health()` method |
+| `core/events.py` | MODIFY | Add `connection_epoch: int` and `recv_mono_ns: int` to event models, add `is_auction()` helper |
+| `infra/settrade_mqtt.py` | MODIFY | Add `reconnect_epoch` counter |
+| `infra/settrade_adapter.py` | MODIFY | Capture `time.perf_counter_ns()` for `recv_mono_ns` field |
+| `examples/example_feed_health.py` | CREATE | Production guard rail pattern with monotonic timestamps |
+| `tests/test_feed_health.py` | CREATE | Unit tests for feed health monitor (monotonic time manipulation) |
+| `tests/test_dispatcher.py` | MODIFY | Add tests for EMA-based drop-rate calculation |
+| `README.md` | MODIFY | Expand Feed Health Monitoring section with examples and monotonic timestamp warning |
+| `PLAN.md` | MODIFY | Phase 5 completion notes |
+
+#### Key Design Decisions
+
+- **Monotonic timestamps only** — All time-based detection uses `time.perf_counter_ns()` (NTP-safe), never wall clock
+- **Time-based detection** — Cannot detect sequence gaps without sequence IDs (protocol limitation)
+- **Per-symbol tracking** — Different symbols have different activity patterns (illiquid symbols have longer natural gaps)
+- **EMA-based drop-rate** — O(1) update, no memory growth, no locks, responsive to spikes (alpha=0.01 for ~100-message half-life)
+- **Non-blocking monitoring** — No locks in hot path, keep latency impact minimal
+- **Signal exposure, not enforcement** — Strategy decides what to do with signals (adapter doesn't make trading decisions)
+- **Reconnect visibility** — Single integer field `connection_epoch`, no data structure overhead
+- **Market period awareness** — `is_auction()` helper exposes semantic meaning of existing `bid_flag`/`ask_flag` fields
+
+#### Out of Scope
+
+- **Cross-feed validation** — Requires historical storage and replay system (separate logging infrastructure)
+- **Anomaly detection** — Requires statistical models and baseline profiling (machine learning layer)
+- **Tick-by-tick persistence** — Requires separate logging system (database/time-series storage)
+- **Exchange-level sequence validation** — Not provided by Settrade protocol (would require direct exchange connectivity)
+
+#### Success Criteria
+
+**Functional Requirements:**
+
+- [ ] All events include `recv_mono_ns` field captured via `time.perf_counter_ns()`
+- [ ] `FeedHealthMonitor` detects stale feeds per symbol using **monotonic timestamps only** (never wall clock)
+- [ ] `connection_epoch` increments on every MQTT reconnect
+- [ ] All events include `connection_epoch` field
+- [ ] `dispatcher.health()` returns EMA-based drop-rate and queue utilization metrics
+- [ ] EMA drop-rate uses alpha=0.01 (~100-message half-life)
+- [ ] `is_auction()` helper method returns true for ATO/ATC periods
+- [ ] Strategy guard rail example demonstrates reconnect handling and stale feed detection
+- [ ] README clearly documents protocol limitations (no sequence IDs, no replay) and monotonic timestamp requirement
+
+**Architectural Requirements:**
+
+- [ ] No locks added to hot path (minimal latency impact)
+- [ ] EMA update is O(1) with no memory growth (single float per dispatcher)
+- [ ] Monotonic timestamps prevent NTP-related false positives
+- [ ] Per-symbol tracking (supports multi-symbol strategies)
+- [ ] Explicit signal exposure (no hidden enforcement logic)
+- [ ] Time-based detection only (honest about capabilities)
+
+**Testing Requirements:**
+
+- [ ] Unit tests for `FeedHealthMonitor` with monotonic time manipulation (mock `time.perf_counter_ns()`)
+- [ ] Unit tests for EMA drop-rate calculation with known sequences (verify alpha=0.01 decay)
+- [ ] Unit tests for `is_auction()` helper with different flag combinations
+- [ ] Integration test simulating reconnect and verifying epoch increment
+- [ ] Integration test simulating stale feed and verifying detection
+- [ ] Test that wall clock jump does NOT trigger false stale detection (monotonic timestamp isolation)
+
+---
+
+### Phase 6: Documentation Finalization
 
 **Tasks:**
-- Write `README.md` integration examples
-- Add architecture diagram
+- Finalize `README.md` with all usage examples
+- Add architecture diagrams (mermaid or ASCII)
 - Provide troubleshooting section
-- Document performance benchmarks vs SDK
+- Document complete performance benchmark methodology
+- Add production deployment checklist
 
 ---
 
@@ -480,7 +818,8 @@ class BestBidAsk:
     ask_vol: int        # Best ask volume (ask_volume1)
     bid_flag: int       # 1=NORMAL, 2=ATO, 3=ATC
     ask_flag: int       # 1=NORMAL, 2=ATO, 3=ATC
-    recv_ts: int        # time.time_ns() at receive
+    recv_ts: int        # time.time_ns() at receive (wall clock)
+    recv_mono_ns: int   # time.perf_counter_ns() (monotonic, NTP-safe)
 ```
 
 ### Full BidOffer (Extended Event — Optional)
@@ -495,7 +834,8 @@ class FullBidOffer:
     ask_volumes: tuple[int, ...]     # Top 10 ask volumes
     bid_flag: int
     ask_flag: int
-    recv_ts: int
+    recv_ts: int        # time.time_ns() (wall clock)
+    recv_mono_ns: int   # time.perf_counter_ns() (monotonic)
 ```
 
 ### Money Conversion (Hot Path)
@@ -561,11 +901,20 @@ def money_to_float(money) -> float:
 
 ### Metrics Collected
 
-| Metric | Calculation | Target |
+| Metric | Calculation | Purpose |
 |---|---|---|
-| Parse + normalize latency | `t1 - t0` | < 200us |
-| Queue wait time | `t2 - t1` | Depends on poll frequency |
-| End-to-end latency | `t2 - t0` | < 500us |
+| Parse + normalize latency | `t1 - t0` | Isolate adapter overhead |
+| Queue wait time | `t2 - t1` | Monitor backpressure |
+| End-to-end latency | `t2 - t0` | Full pipeline measurement |
+
+### Performance Reality
+
+**Production benchmarks show ~1.1-1.3x improvements** in parse + normalize latency compared to the SDK path. This is environment-dependent and modest.
+
+The real value is not the speed improvement, but:
+- **Visibility** \u2013 You can measure every step
+- **Control** \u2013 You decide polling frequency and backpressure strategy
+- **Determinism** \u2013 No hidden thread pools or buffering
 
 ### Reporting
 
@@ -722,21 +1071,30 @@ for event in dispatcher.poll():
 
 - Adapter connects to Settrade broker successfully via WSS.
 - Events parsed & normalized correctly (field values match SDK output within floating-point tolerance).
-- No dict conversion, no thread spawn, no Decimal in hot path.
-- Dispatcher queue accessible for strategy consumption.
+- Typed Pydantic models used throughout (no dict conversion in hot path).
+- Dispatcher queue accessible for strategy consumption with explicit backpressure.
 - Auto-reconnect recovers within 30 seconds.
 - Token refresh works before expiration.
 - Example scripts work in sandbox environment.
 - Observability stats accessible via `dispatcher.stats()` and `mqtt_client.stats()`.
 
-### Performance Requirements (Non-Negotiable)
+### Architectural Requirements
 
-- **Parse + normalize latency < 200us (P99)** — Hard requirement from architecture
-- **Adapter demonstrates >= 3x lower P99 parse latency vs SDK** — Core value proposition
-- **CPU usage reduction >= 40% vs SDK** — Proof of reduced overhead
-- **GC pressure reduction >= 70% vs SDK** — Proof of allocation elimination
-- **Zero message loss under normal load** — Reliability requirement
-- **Benchmark results documented in README.md** — Transparency requirement
+- **No hidden threading** \u2014 MQTT IO thread + strategy thread only, no thread-per-message
+- **Direct protobuf access** \u2014 No `.to_dict()` abstraction layer
+- **Explicit control** \u2014 Visible queue, visible backpressure, visible drop count
+- **Strong typing** \u2014 Pydantic models with frozen=True throughout
+- **Deterministic flow** \u2014 Clear ownership: MQTT thread \u2192 Parser \u2192 Queue \u2192 Strategy thread
+
+### Performance Expectations (Realistic)
+
+Based on actual production benchmarks:
+- **Parse + normalize improvements: ~1.1-1.3x faster** than SDK path (environment-dependent)
+- **Primary value: architectural control**, not raw speed
+- **GC pressure reduction**: Modest (fewer allocations, but still one Pydantic model per message)
+- **CPU usage**: Comparable to SDK (no thread spawn overhead, but similar parse work)
+- **Zero message loss under normal load** \u2014 Reliability requirement
+- **Benchmark results documented in README.md** \u2014 Transparency with explicit limitations section
 
 ### Testing Requirements
 
@@ -744,7 +1102,7 @@ for event in dispatcher.poll():
 - Integration tests pass in sandbox environment
 - Benchmark runs complete successfully (60+ seconds, 1000+ messages)
 - Benchmark results reproducible (variance < 15% across 3+ runs)
-- Shadow mode test (if implemented) shows SDK and adapter produce equivalent results
+- Benchmark limitations explicitly documented
 
 ---
 

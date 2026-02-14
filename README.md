@@ -62,6 +62,7 @@ Compared to the official SDK's dictionary-based approach:
 | **Backpressure** | Implicit (thread pool) | Explicit (drop-oldest) |
 | **Replay Support** | Not designed for it | Easier to integrate |
 | **Integration** | High-level convenience | Low-level control |
+| **Event Continuity Guarantee** | Not specified | Snapshot-based only (no sequence IDs) |
 
 ### Why Choose This Adapter?
 
@@ -84,6 +85,24 @@ However, it returns dynamic JSON-style dictionaries and hides the ingestion pipe
 - Official support and updates
 - Order execution API integration
 - You don't need pipeline-level control
+
+---
+
+## Intended Audience
+
+This project is designed for:
+
+- **Retail algorithmic traders** building custom trading infrastructure
+- **Developers** who require pipeline-level control over market data
+- **System integrators** who need explicit threading and backpressure management
+- **Researchers** who need typed events and replay mechanisms
+
+**This adapter is NOT intended for:**
+
+- **Ultra-low-latency HFT** — Co-located exchange trading requires direct exchange feeds
+- **Systems requiring exchange-level sequence guarantees** — This is a snapshot feed without sequence IDs
+- **Production systems without feed health monitoring** — See Feed Health Monitoring section below
+- **Users who need exact decimal precision** — This adapter uses float representation for speed
 
 ---
 
@@ -182,6 +201,129 @@ For authoritative results, benchmark on your target production environment with 
 
 ---
 
+## Market Data Guarantees & Limitations
+
+### Data Model Characteristics
+
+This adapter consumes **snapshot-based market data** (e.g., `BidOfferV3`).
+
+**Important implications:**
+
+- ❌ **No exchange sequence numbers are provided** — Cannot detect gaps at the exchange level
+- ❌ **No incremental delta updates** — Each message is a full snapshot
+- ❌ **No replay mechanism** — Missed messages during disconnect cannot be recovered
+- ❌ **No event-level continuity guarantee** — Silent gaps are possible
+
+**Each message represents the current top-of-book snapshot at publish time.**
+
+### What Happens During Disconnect?
+
+If the MQTT connection drops:
+
+- ✅ **Order book state remains correct** — Reconnect receives the latest snapshot
+- ❌ **Intermediate snapshots are lost** — Data between disconnect and reconnect is not recoverable
+- ❌ **Microstructure transitions are not observable** — Price movements during the gap are invisible
+
+This is a **snapshot stream**, not an incremental sequenced feed.
+
+### Silent Gap Risk
+
+Because no exchange sequence number is provided:
+
+- ❌ **Event-level gap detection is not possible** — Cannot tell if message N+1 immediately follows message N
+- ❌ **The adapter cannot detect lost messages at the exchange level** — MQTT QoS 0 may drop messages under load
+- ⚠️ **Feed health must be monitored via time-based liveness detection** — See next section
+
+**Users building trading systems must account for this limitation.**
+
+### Transparency = Credibility
+
+This adapter does **not** provide:
+
+- Exchange sequence numbers
+- Gap detection
+- Message replay
+- Continuity guarantees
+
+It provides **what it is**: a low-level **snapshot ingestion layer** with explicit control.
+
+If you need exchange-level sequencing, consider direct exchange connectivity or a different data provider.
+
+---
+
+## Feed Health Monitoring (Recommended)
+
+### Why You Need This
+
+Because this is a **snapshot feed without sequence IDs**, production trading systems **must** implement:
+
+- **Feed liveness detection** — Detect stale feed (max inter-event gap)
+- **Reconnect detection** — Detect when the adapter reconnects (events may have been missed)
+- **Strategy guard rails** — Block trading decisions when feed becomes stale
+
+**This adapter intentionally does not embed trading logic** — feed health monitoring is your responsibility.
+
+### Recommended Pattern
+
+```python
+import time
+from typing import Optional
+
+class FeedHealthMonitor:
+    """Simple time-based feed health monitor."""
+    
+    def __init__(self, max_gap_seconds: float = 5.0):
+        self.max_gap_seconds = max_gap_seconds
+        self.last_event_time: Optional[float] = None
+        self.is_stale = False
+    
+    def on_event(self, event) -> None:
+        """Call this every time you receive an event."""
+        self.last_event_time = time.time()
+        self.is_stale = False
+    
+    def check_health(self) -> bool:
+        """Returns False if feed is stale."""
+        if self.last_event_time is None:
+            return False  # No data yet
+        
+        gap = time.time() - self.last_event_time
+        if gap > self.max_gap_seconds:
+            self.is_stale = True
+            return False
+        
+        return True
+
+# Usage in strategy loop
+feed_monitor = FeedHealthMonitor(max_gap_seconds=5.0)
+
+while True:
+    events = dispatcher.poll(max_events=100)
+    
+    for event in events:
+        feed_monitor.on_event(event)
+        
+        # Guard rail: skip trading decisions if feed is stale
+        if not feed_monitor.check_health():
+            print("WARNING: Feed is stale, skipping trading decision")
+            continue
+        
+        # Safe to make trading decisions
+        process_event(event)
+```
+
+### Production Considerations
+
+For production trading systems, consider:
+
+- **Multiple symbols** — Track liveness per symbol (some symbols are illiquid)
+- **Market hours** — Different gap thresholds during market open vs pre-open
+- **Reconnect events** — Log and alert when reconnects occur
+- **Circuit breakers** — Automatically halt trading when feed health degrades
+- **Latency monitoring** — Track `recv_mono_ns` to detect feed lag
+
+---
+
 ## Architecture
 
 ```text
@@ -217,7 +359,7 @@ settrade-feed-adapter/
 
 ```text
 MQTT Broker (WSS/443)
-    │
+    │                       (snapshot stream, no replay, no sequence IDs)
     ▼
 SettradeMQTTClient          ← MQTT IO thread (paho loop_start)
     │ on_message(payload)
@@ -254,6 +396,18 @@ pip install -e .
 ---
 
 ## Quick Start
+
+> ⚠️ **Production Use Notice**
+>
+> This adapter provides **snapshot-based market data ingestion**.
+> It does **not** guarantee event continuity or replay.
+>
+> If you build automated trading systems on top of it, you **must** implement:
+> - Feed health monitoring (see Feed Health Monitoring section)
+> - Reconnect detection
+> - Circuit breakers when feed becomes stale
+>
+> See the **Market Data Guarantees & Limitations** section for details.
 
 1. Copy `.env.sample` to `.env` and fill in credentials:
 

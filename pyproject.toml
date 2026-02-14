@@ -1,7 +1,7 @@
 [project]
 name = "settrade-feed-adapter"
 version = "0.1.0"
-description = "Add your description here"
+description = "Market data ingestion layer for Settrade Open API with typed events and explicit control"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
