@@ -1,35 +1,110 @@
 # settrade-feed-adapter
 
-A lightweight Python adapter for subscribing to real-time market data from **Settrade Open API** via MQTT, bypassing the official Python SDK.
-Designed for algorithmic trading systems and market data pipelines where **low latency and minimal overhead** are critical.
+A **market data ingestion layer** for Settrade Open API that provides direct control over the MQTT → Protobuf → Event pipeline.
 
-> This adapter connects to Settrade's MQTT feed directly, parses protobuf messages using the official protobuf schemas, and emits normalized events to your own dispatcher or strategy engine.
+Designed for developers who need **explicit control**, **typed event models**, and **deterministic backpressure handling** instead of the convenient but opaque official SDK.
+
+> This adapter is an infrastructure foundation, not a trading framework. It ends at normalized event emission — what you do with those events is your responsibility.
 
 Official Settrade API Docs: https://developer.settrade.com/open-api/api-reference/reference/sdkv2/python/market-mqtt-realtime-data/1_gettingStart
 
 ---
 
-## Features
+## Design Philosophy
 
-- Direct MQTT connection to Settrade's real-time data feed (no SDK wrapper layer)
-- Parse binary protobuf messages (BidOfferV3) for depth & bid/offer data
-- Normalized Pydantic event models (`BestBidAsk`, `FullBidOffer`) for downstream processing
-- Bounded event dispatcher (`Dispatcher[T]`) with drop-oldest backpressure
-- Minimal allocations & overhead for low-latency use cases
-- Easy integration with event dispatcher / strategy loops
+This project is built on these architectural principles:
+
+- **Minimal hot-path logic** — Parse and normalize only, no business logic
+- **Explicit backpressure** — Bounded queue with drop-oldest strategy (no hidden buffering)
+- **No hidden thread pools** — Single MQTT IO thread, explicit dispatcher, clear ownership
+- **Strong typing** — Pydantic models instead of dynamic dictionaries
+- **Predictable event flow** — Deterministic pipeline from bytes to typed events
+- **Nanosecond timestamps** — Dual timestamps (`recv_ts` wall clock + `recv_mono_ns` monotonic) for latency measurement
+
+---
+
+## Scope
+
+This project focuses **solely on market data ingestion**.
+
+### What This Adapter Provides
+
+- MQTT transport handling (WebSocket Secure + TLS + auto-reconnect)
+- Protobuf decoding (BidOfferV3 → typed events)
+- Event normalization (`BestBidAsk`, `FullBidOffer` models)
+- Bounded dispatch queue with explicit drop strategy
+- Direct protobuf field access (no JSON/dict layer)
+
+### What This Adapter Does NOT Provide
+
+- **Order execution** — Use the official SDK's order API
+- **Strategy logic** — Implement your own
+- **Persistence / data storage** — Up to you (InfluxDB, Parquet, etc.)
+- **Replay systems** — Build on top if needed
+- **Backtesting** — Out of scope
+- **Risk management** — Your responsibility
+- **Position tracking** — Not included
+
+This is an **ingestion layer**, not a trading framework.
+
+---
+
+## Key Architectural Advantages
+
+Compared to the official SDK's dictionary-based approach:
+
+| Aspect | Official SDK | This Adapter |
+| --- | --- | --- |
+| **Data Model** | Dynamic `dict` | Typed Pydantic models |
+| **Event Dispatch** | Hidden threading | Explicit bounded queue |
+| **Pipeline Visibility** | Opaque callbacks | You own the flow |
+| **Abstraction Layer** | JSON-style `.to_dict()` | Direct protobuf field access |
+| **Backpressure** | Implicit (thread pool) | Explicit (drop-oldest) |
+| **Replay Support** | Not designed for it | Easier to integrate |
+| **Integration** | High-level convenience | Low-level control |
+
+### Why Choose This Adapter?
+
+The official SDK is **production-ready and convenient** for most use cases.
+
+However, it returns dynamic JSON-style dictionaries and hides the ingestion pipeline behind callback threads.
+
+**Use this adapter if you need:**
+
+- Explicit control over message parsing and event flow
+- Strongly typed events for safer integration
+- Custom backpressure handling for high-frequency data
+- Integration into low-latency pipelines with measurable overhead
+- Foundation for building custom trading infrastructure
+- Easier testing and replay mechanisms
+
+**Stick with the SDK if you need:**
+
+- Convenience and simplicity
+- Official support and updates
+- Order execution API integration
+- You don't need pipeline-level control
 
 ---
 
 ## Performance
 
-This adapter eliminates four specific SDK bottlenecks in the hot path:
+### Realistic Performance Expectations
 
-| Bottleneck | Official SDK | This Adapter |
-| --- | --- | --- |
-| Callback execution | `threading.Thread` per message | Inline in MQTT thread |
-| Message parsing | `.parse(msg).to_dict(casing=SNAKE)` | `.parse(msg)` + direct field access |
-| Price conversion | `Decimal(units) + Decimal(nanos) / 1e9` | `units + nanos * 1e-9` (float) |
-| Synchronization | `threading.Lock` on callback pool | `deque.append()` (GIL-atomic) |
+This adapter provides **modest latency improvements** in parse + normalize operations (approximately **1.1–1.3x faster** than the SDK path in practice), depending on workload and environment.
+
+**The primary value is architectural control and deterministic event flow, not raw microsecond gains.**
+
+### Implementation Differences
+
+The adapter takes a different approach than the SDK:
+
+| Implementation Choice | Official SDK | This Adapter | Tradeoff |
+| --- | --- | --- | --- |
+| **Callback execution** | `threading.Thread` per message | Inline in MQTT thread | Less overhead, but blocks IO thread |
+| **Message parsing** | `.parse(msg).to_dict(casing=SNAKE)` | `.parse(msg)` + direct field access | Fewer allocations, but less convenient |
+| **Price representation** | `Decimal(units) + Decimal(nanos) / 1e9` | `units + nanos * 1e-9` (float) | Faster, but loses exact decimal precision |
+| **Synchronization** | `threading.Lock` on callback pool | `deque.append()` (GIL-atomic) | Simpler, assumes CPython GIL |
 
 ### Benchmark Methodology
 
@@ -73,28 +148,37 @@ python -m scripts.benchmark_adapter --num-messages 50000 --num-runs 3
 python -m scripts.benchmark_compare --num-messages 100000 --target-p99-ratio 3.0
 ```
 
-### Expected Performance Targets
+### Performance Notes
 
-Based on architectural improvements (no thread spawn, no `.to_dict()`, no `Decimal`, no locks):
+**In practice**, parse + normalize latency improvements are **modest (~1.1–1.3x)** and highly environment-dependent.
 
-| Metric | SDK Baseline (est.) | Adapter Target | Improvement Target |
-| --- | --- | --- | --- |
-| P50 latency | ~120-150us | ~30-50us | 3-4x faster |
-| P95 latency | ~250-350us | ~60-90us | 3-5x faster |
-| P99 latency | ~400-600us | ~100-150us | 3-6x faster |
-| GC gen-0 collections | Higher | Lower | Reduced allocation pressure |
+Absolute latency numbers vary by:
+- CPU model and clock speed
+- OS scheduler behavior and system load
+- Python version and interpreter optimizations
+- Memory pressure and garbage collection timing
 
-### Benchmark Limitations
+**The comparison ratio (adapter vs SDK) is more stable than absolute numbers.**
 
-These benchmarks have known limitations that should be considered when interpreting results:
+For authoritative results, benchmark on your target production environment with your actual workload.
 
-- **Synthetic payloads only** — benchmarks use `SerializeToString()` payloads, not live broker traffic. Real-world payloads may differ in size and field population.
-- **Single-threaded measurement** — benchmarks measure parse latency in isolation. Production systems have GIL contention from the MQTT IO thread and strategy thread running concurrently.
-- **CPython-specific** — all results assume CPython's GIL guarantees for `deque.append()` / `deque.popleft()` atomicity. Results are not valid for PyPy, GraalPy, or nogil Python.
-- **Float vs Decimal** — the adapter converts `Money(units, nanos)` to `float` via `units + nanos * 1e-9`. The SDK uses `Decimal` for exact arithmetic. For prices requiring exact decimal representation (e.g., regulatory reporting), the SDK path may be more appropriate. The adapter path is designed for latency-sensitive trading where float precision (~15 significant digits) is sufficient.
-- **Environment-dependent** — latency numbers vary by CPU, OS scheduler, and system load. The comparison **ratio** (adapter vs SDK) is more stable than absolute numbers. Benchmark on your target production environment for authoritative results.
-- **No network latency** — benchmarks measure parse + normalize cost only. Network latency (broker to client) is identical for both paths and not measured.
-- **`process_time` resolution** — CPU measurement uses `time.process_time()` which has OS-dependent resolution (~1ms on some platforms). Short benchmark runs may show 0% CPU.
+### Important Benchmark Limitations
+
+**Read this carefully before interpreting results:**
+
+- **Synthetic payloads only** — Benchmarks use `SerializeToString()` payloads, not live broker traffic. Real-world payloads may differ in size and field population.
+  
+- **Isolated measurement** — Benchmarks measure parse latency in isolation. Production systems have GIL contention from the MQTT IO thread and strategy thread running concurrently. **Real-world speedups will be lower.**
+
+- **CPython-specific** — All results assume CPython's GIL guarantees for `deque.append()` / `deque.popleft()` atomicity. Results are not valid for PyPy, GraalPy, or nogil Python.
+
+- **Float vs Decimal precision** — The adapter converts `Money(units, nanos)` to `float` via `units + nanos * 1e-9`. The SDK uses `Decimal` for exact arithmetic. **If you need exact decimal representation (e.g., regulatory reporting, accounting), the SDK path may be more appropriate.** The adapter path is designed for latency-sensitive trading where float precision (~15 significant digits) is typically sufficient.
+
+- **Environment-dependent** — Absolute latency numbers vary by CPU, OS scheduler, and system load. Benchmark on your target production environment for authoritative results.
+
+- **No network latency** — Benchmarks measure parse + normalize cost only. Network latency (broker to client) is identical for both paths and excluded from measurement.
+
+- **`process_time` resolution** — CPU measurement uses `time.process_time()` which has OS-dependent resolution (~1ms on some platforms).
 
 ---
 
