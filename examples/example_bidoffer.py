@@ -38,6 +38,8 @@ import logging
 import os
 import time
 
+from dotenv import load_dotenv
+
 from core.dispatcher import Dispatcher, DispatcherConfig
 from core.events import BestBidAsk
 from infra.settrade_adapter import BidOfferAdapter, BidOfferAdapterConfig
@@ -57,6 +59,9 @@ _MAX_LATENCY_SAMPLES: int = 1_000_000
 
 def main() -> None:
     """Run BidOffer feed example with latency measurement."""
+    # Load environment variables from .env file
+    load_dotenv()
+
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description="Real-time BidOffer feed with latency measurement",
     )
