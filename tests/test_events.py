@@ -60,8 +60,8 @@ class TestBestBidAsk:
             ask=26.0,
             bid_vol=1000,
             ask_vol=500,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -83,8 +83,8 @@ class TestBestBidAsk:
             ask=26.0,
             bid_vol=1000,
             ask_vol=500,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -100,8 +100,8 @@ class TestBestBidAsk:
                 ask=26.0,
                 bid_vol=1000,
                 ask_vol=500,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
                 extra_field="bad",  # type: ignore[call-arg]
@@ -116,8 +116,8 @@ class TestBestBidAsk:
                 ask=26.0,
                 bid_vol=1000,
                 ask_vol=500,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
             )
@@ -131,8 +131,8 @@ class TestBestBidAsk:
                 ask=26.0,
                 bid_vol=-1,
                 ask_vol=500,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
             )
@@ -146,8 +146,8 @@ class TestBestBidAsk:
                 ask=26.0,
                 bid_vol=1000,
                 ask_vol=500,
-                bid_flag=5,
-                ask_flag=1,
+                bid_flag=5,  # type: ignore[arg-type]
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
             )
@@ -161,8 +161,8 @@ class TestBestBidAsk:
                 ask=26.0,
                 bid_vol=1000,
                 ask_vol=500,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=-1,
                 recv_mono_ns=123456789,
             )
@@ -176,8 +176,8 @@ class TestBestBidAsk:
                 ask=26.0,
                 bid_vol=1000,
                 ask_vol=500,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=-1,
             )
@@ -246,8 +246,8 @@ class TestBestBidAsk:
             ask=-0.5,
             bid_vol=0,
             ask_vol=0,
-            bid_flag=0,
-            ask_flag=0,
+            bid_flag=BidAskFlag.UNDEFINED,
+            ask_flag=BidAskFlag.UNDEFINED,
             recv_ts=0,
             recv_mono_ns=0,
         )
@@ -262,8 +262,8 @@ class TestBestBidAsk:
             ask=26.0,
             bid_vol=1000,
             ask_vol=500,
-            bid_flag=0,
-            ask_flag=0,
+            bid_flag=BidAskFlag.UNDEFINED,
+            ask_flag=BidAskFlag.UNDEFINED,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -277,8 +277,8 @@ class TestBestBidAsk:
             ask=26.0,
             bid_vol=1000,
             ask_vol=500,
-            bid_flag=3,
-            ask_flag=3,
+            bid_flag=BidAskFlag.ATC,
+            ask_flag=BidAskFlag.ATC,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -293,8 +293,8 @@ class TestBestBidAsk:
             ask=26.0,
             bid_vol=1000,
             ask_vol=500,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -312,8 +312,8 @@ class TestBestBidAsk:
             ask=26.0,
             bid_vol=1000,
             ask_vol=500,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -329,15 +329,174 @@ class TestBestBidAsk:
             symbol="AOT",
             bid=25.5,
             ask=26.0,
-            bid_vol=1000,  # type: ignore[arg-type]
+            bid_vol="1000",  # type: ignore[arg-type]
             ask_vol=500,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
         assert isinstance(event.bid_vol, int)
         assert event.bid_vol == 1000
+
+    def test_bid_greater_than_ask_allowed(self) -> None:
+        """bid > ask is allowed — model does not enforce spread logic.
+
+        Strategy-level validation owns spread sanity checks. The event
+        model is a transport-layer struct, not a business rule enforcer.
+        """
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=30.0,
+            ask=25.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.bid > event.ask
+
+    def test_large_timestamp_accepted(self) -> None:
+        """Extremely large timestamps are accepted (no upper bound)."""
+        large_ts: int = 2**63 - 1
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=large_ts,
+            recv_mono_ns=large_ts,
+        )
+        assert event.recv_ts == large_ts
+        assert event.recv_mono_ns == large_ts
+
+    def test_connection_epoch_default_zero(self) -> None:
+        """connection_epoch defaults to 0."""
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.connection_epoch == 0
+
+    def test_connection_epoch_custom_value(self) -> None:
+        """connection_epoch accepts custom values."""
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+            connection_epoch=3,
+        )
+        assert event.connection_epoch == 3
+
+    def test_connection_epoch_negative_rejected(self) -> None:
+        """Negative connection_epoch is rejected (ge=0)."""
+        with pytest.raises(ValidationError):
+            BestBidAsk(
+                symbol="AOT",
+                bid=25.5,
+                ask=26.0,
+                bid_vol=1000,
+                ask_vol=500,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
+                recv_ts=1739500000000000000,
+                recv_mono_ns=123456789,
+                connection_epoch=-1,
+            )
+
+    def test_is_auction_normal_flags(self) -> None:
+        """is_auction() returns False for NORMAL flags."""
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.is_auction() is False
+
+    def test_is_auction_ato_bid_flag(self) -> None:
+        """is_auction() returns True when bid_flag is ATO."""
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.ATO,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.is_auction() is True
+
+    def test_is_auction_atc_ask_flag(self) -> None:
+        """is_auction() returns True when ask_flag is ATC."""
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.ATC,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.is_auction() is True
+
+    def test_is_auction_undefined_flags(self) -> None:
+        """is_auction() returns False for UNDEFINED flags."""
+        event: BestBidAsk = BestBidAsk(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=BidAskFlag.UNDEFINED,
+            ask_flag=BidAskFlag.UNDEFINED,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.is_auction() is False
+
+    def test_is_auction_model_construct_int_values(self) -> None:
+        """is_auction() works with raw int values from model_construct()."""
+        event: BestBidAsk = BestBidAsk.model_construct(
+            symbol="AOT",
+            bid=25.5,
+            ask=26.0,
+            bid_vol=1000,
+            ask_vol=500,
+            bid_flag=2,  # ATO as raw int
+            ask_flag=1,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+            connection_epoch=0,
+        )
+        assert event.is_auction() is True
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +518,8 @@ class TestFullBidOffer:
             ask_prices=_TEN_PRICES,
             bid_volumes=_TEN_VOLUMES,
             ask_volumes=_TEN_VOLUMES,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -379,8 +538,8 @@ class TestFullBidOffer:
             ask_prices=_TEN_PRICES,
             bid_volumes=_TEN_VOLUMES,
             ask_volumes=_TEN_VOLUMES,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -395,8 +554,8 @@ class TestFullBidOffer:
             ask_prices=_TEN_PRICES,
             bid_volumes=_TEN_VOLUMES,
             ask_volumes=_TEN_VOLUMES,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -412,8 +571,8 @@ class TestFullBidOffer:
                 ask_prices=_TEN_PRICES,
                 bid_volumes=_TEN_VOLUMES,
                 ask_volumes=_TEN_VOLUMES,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
                 extra="bad",  # type: ignore[call-arg]
@@ -428,8 +587,8 @@ class TestFullBidOffer:
                 ask_prices=_TEN_PRICES,
                 bid_volumes=_TEN_VOLUMES,
                 ask_volumes=_TEN_VOLUMES,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
             )
@@ -443,8 +602,8 @@ class TestFullBidOffer:
                 ask_prices=_TEN_PRICES,
                 bid_volumes=_TEN_VOLUMES,
                 ask_volumes=_TEN_VOLUMES,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
             )
@@ -458,8 +617,8 @@ class TestFullBidOffer:
                 ask_prices=_TEN_PRICES,
                 bid_volumes=_TEN_VOLUMES,
                 ask_volumes=_TEN_VOLUMES,
-                bid_flag=1,
-                ask_flag=1,
+                bid_flag=BidAskFlag.NORMAL,
+                ask_flag=BidAskFlag.NORMAL,
                 recv_ts=1739500000000000000,
                 recv_mono_ns=123456789,
             )
@@ -489,8 +648,8 @@ class TestFullBidOffer:
             ask_prices=_TEN_PRICES,
             bid_volumes=_TEN_VOLUMES,
             ask_volumes=_TEN_VOLUMES,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1000000000,
             recv_mono_ns=2000000000,
         )
@@ -505,8 +664,8 @@ class TestFullBidOffer:
             ask_prices=_TEN_PRICES,
             bid_volumes=_TEN_VOLUMES,
             ask_volumes=_TEN_VOLUMES,
-            bid_flag=0,
-            ask_flag=3,
+            bid_flag=BidAskFlag.UNDEFINED,
+            ask_flag=BidAskFlag.ATC,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -521,8 +680,8 @@ class TestFullBidOffer:
             ask_prices=_TEN_PRICES,
             bid_volumes=_TEN_VOLUMES,
             ask_volumes=_TEN_VOLUMES,
-            bid_flag=1,
-            ask_flag=1,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
             recv_ts=1739500000000000000,
             recv_mono_ns=123456789,
         )
@@ -533,3 +692,84 @@ class TestFullBidOffer:
         # Can be used as dict key
         d: dict[FullBidOffer, str] = {e1: "test"}
         assert d[e1] == "test"
+
+    def test_connection_epoch_default_zero(self) -> None:
+        """connection_epoch defaults to 0."""
+        event: FullBidOffer = FullBidOffer(
+            symbol="AOT",
+            bid_prices=_TEN_PRICES,
+            ask_prices=_TEN_PRICES,
+            bid_volumes=_TEN_VOLUMES,
+            ask_volumes=_TEN_VOLUMES,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.connection_epoch == 0
+
+    def test_connection_epoch_custom_value(self) -> None:
+        """connection_epoch accepts custom values."""
+        event: FullBidOffer = FullBidOffer(
+            symbol="AOT",
+            bid_prices=_TEN_PRICES,
+            ask_prices=_TEN_PRICES,
+            bid_volumes=_TEN_VOLUMES,
+            ask_volumes=_TEN_VOLUMES,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+            connection_epoch=5,
+        )
+        assert event.connection_epoch == 5
+
+    def test_negative_volume_allowed(self) -> None:
+        """Negative volume is allowed — no ge=0 on tuple elements.
+
+        Volume tuples use ``tuple[int, ...]`` without per-element
+        constraints. Defensive validation is deferred to strategy layer,
+        consistent with BestBidAsk volume fields.
+        """
+        event: FullBidOffer = FullBidOffer(
+            symbol="AOT",
+            bid_prices=_TEN_PRICES,
+            ask_prices=_TEN_PRICES,
+            bid_volumes=(-1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            ask_volumes=_TEN_VOLUMES,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.bid_volumes[0] == -1
+
+    def test_is_auction_normal(self) -> None:
+        """is_auction() returns False for NORMAL flags."""
+        event: FullBidOffer = FullBidOffer(
+            symbol="AOT",
+            bid_prices=_TEN_PRICES,
+            ask_prices=_TEN_PRICES,
+            bid_volumes=_TEN_VOLUMES,
+            ask_volumes=_TEN_VOLUMES,
+            bid_flag=BidAskFlag.NORMAL,
+            ask_flag=BidAskFlag.NORMAL,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.is_auction() is False
+
+    def test_is_auction_ato(self) -> None:
+        """is_auction() returns True for ATO flags."""
+        event: FullBidOffer = FullBidOffer(
+            symbol="AOT",
+            bid_prices=_TEN_PRICES,
+            ask_prices=_TEN_PRICES,
+            bid_volumes=_TEN_VOLUMES,
+            ask_volumes=_TEN_VOLUMES,
+            bid_flag=BidAskFlag.ATO,
+            ask_flag=BidAskFlag.ATO,
+            recv_ts=1739500000000000000,
+            recv_mono_ns=123456789,
+        )
+        assert event.is_auction() is True

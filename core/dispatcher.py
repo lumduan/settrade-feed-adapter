@@ -94,6 +94,11 @@ class DispatcherConfig(BaseModel):
         maxlen: Maximum number of events the queue can hold. When the
             queue is full, ``push()`` causes the oldest event to be
             evicted (drop-oldest policy). Must be greater than zero.
+        ema_alpha: Smoothing factor for exponential moving average of
+            drop rate. Smaller values → smoother signal with slower
+            response. Default 0.01 (~100-message half-life).
+        drop_warning_threshold: Drop rate EMA threshold that triggers
+            a warning log in ``push()``. Default 0.01 (1%).
 
     Example:
         >>> config = DispatcherConfig(maxlen=50_000)
@@ -109,6 +114,24 @@ class DispatcherConfig(BaseModel):
         description=(
             "Maximum queue length. Oldest events are dropped when exceeded. "
             "Default 100,000 ~ 10 seconds at 10K msg/s."
+        ),
+    )
+    ema_alpha: float = Field(
+        default=0.01,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "EMA smoothing factor for drop rate. "
+            "Default 0.01 (~100-message half-life)."
+        ),
+    )
+    drop_warning_threshold: float = Field(
+        default=0.01,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Drop rate EMA threshold for warning log. "
+            "Default 0.01 (1% drop rate)."
         ),
     )
 
@@ -172,6 +195,54 @@ class DispatcherStats(BaseModel):
     maxlen: int = Field(
         gt=0,
         description="Configured maximum queue length.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health Model
+# ---------------------------------------------------------------------------
+
+
+class DispatcherHealth(BaseModel):
+    """Immutable snapshot of dispatcher health metrics.
+
+    Returned by :meth:`Dispatcher.health`. Provides real-time drop
+    rate (EMA-smoothed) and lifetime counters for forensic analysis.
+
+    Attributes:
+        drop_rate_ema: Smoothed drop rate. 0.0 means no drops,
+            1.0 means every push drops. Updated on each ``push()``.
+        queue_utilization: Current queue fill ratio. 0.0 = empty,
+            1.0 = full.
+        total_dropped: Cumulative drops since last ``clear()``.
+        total_pushed: Cumulative pushes since last ``clear()``.
+
+    Example:
+        >>> h = dispatcher.health()
+        >>> h.drop_rate_ema
+        0.0
+        >>> h.queue_utilization
+        0.02
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    drop_rate_ema: float = Field(
+        ge=0.0,
+        description="Smoothed drop rate (EMA). 0.0 = no drops.",
+    )
+    queue_utilization: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Queue fill ratio: len(queue) / maxlen.",
+    )
+    total_dropped: int = Field(
+        ge=0,
+        description="Cumulative drops since last clear().",
+    )
+    total_pushed: int = Field(
+        ge=0,
+        description="Cumulative pushes since last clear().",
     )
 
 
@@ -247,6 +318,14 @@ class Dispatcher(Generic[T]):
         self._total_polled: int = 0
         self._total_dropped: int = 0
 
+        # EMA drop-rate tracking — push thread only
+        self._ema_alpha: float = self._config.ema_alpha
+        self._drop_warning_threshold: float = (
+            self._config.drop_warning_threshold
+        )
+        self._drop_rate_ema: float = 0.0
+        self._warned_drop_rate: bool = False
+
         logger.info(
             "Dispatcher created with maxlen=%d",
             self._maxlen,
@@ -268,9 +347,16 @@ class Dispatcher(Generic[T]):
             item atomically (deque(maxlen) contract). The pre-check
             is safe under SPSC because only this thread appends.
 
+        EMA tracking:
+            Updates the drop-rate EMA after each push:
+            ``ema = alpha * sample + (1 - alpha) * ema``
+            where ``sample`` is 1.0 on drop, 0.0 otherwise.
+            Logs a warning when EMA crosses the configured threshold.
+
         Counter contract:
-            ``_total_pushed`` and ``_total_dropped`` are single-writer
-            (push thread only). No lock required.
+            ``_total_pushed``, ``_total_dropped``, and
+            ``_drop_rate_ema`` are single-writer (push thread only).
+            No lock required.
 
         Args:
             event: The event to push. Typed as ``T`` for generic
@@ -281,10 +367,32 @@ class Dispatcher(Generic[T]):
             >>> dispatcher.stats().total_pushed
             1
         """
+        dropped: float = 0.0
         if len(self._queue) == self._maxlen:
             self._total_dropped += 1
+            dropped = 1.0
         self._queue.append(event)
         self._total_pushed += 1
+
+        # EMA: ema = alpha * sample + (1 - alpha) * ema
+        alpha: float = self._ema_alpha
+        self._drop_rate_ema = alpha * dropped + (1.0 - alpha) * self._drop_rate_ema
+
+        if self._drop_rate_ema > self._drop_warning_threshold:
+            if not self._warned_drop_rate:
+                logger.warning(
+                    "Drop rate EMA %.4f exceeds threshold %.4f",
+                    self._drop_rate_ema,
+                    self._drop_warning_threshold,
+                )
+                self._warned_drop_rate = True
+        elif self._warned_drop_rate:
+            logger.info(
+                "Drop rate EMA %.4f recovered below threshold %.4f",
+                self._drop_rate_ema,
+                self._drop_warning_threshold,
+            )
+            self._warned_drop_rate = False
 
     # ------------------------------------------------------------------
     # Consumer Path: Poll (Strategy thread)
@@ -366,6 +474,8 @@ class Dispatcher(Generic[T]):
         self._total_pushed = 0
         self._total_polled = 0
         self._total_dropped = 0
+        self._drop_rate_ema = 0.0
+        self._warned_drop_rate = False
         logger.info("Dispatcher cleared: queue and counters reset")
 
     # ------------------------------------------------------------------
@@ -400,6 +510,35 @@ class Dispatcher(Generic[T]):
             total_dropped=self._total_dropped,
             queue_len=len(self._queue),
             maxlen=self._maxlen,
+        )
+
+    # ------------------------------------------------------------------
+    # Health (strategy thread)
+    # ------------------------------------------------------------------
+
+    def health(self) -> DispatcherHealth:
+        """Return health metrics for feed integrity monitoring.
+
+        Provides real-time drop rate (EMA-smoothed) and lifetime
+        counters for forensic analysis. Intended for strategy-side
+        guard rails.
+
+        Lock-free, eventually consistent (same guarantees as
+        :meth:`stats`).
+
+        Returns:
+            Frozen :class:`DispatcherHealth` with current health values.
+
+        Example:
+            >>> h = dispatcher.health()
+            >>> if h.drop_rate_ema > 0.01:
+            ...     logger.warning("High drop rate: %.4f", h.drop_rate_ema)
+        """
+        return DispatcherHealth(
+            drop_rate_ema=self._drop_rate_ema,
+            queue_utilization=len(self._queue) / self._maxlen,
+            total_dropped=self._total_dropped,
+            total_pushed=self._total_pushed,
         )
 
     # ------------------------------------------------------------------

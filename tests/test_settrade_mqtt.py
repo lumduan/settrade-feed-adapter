@@ -906,6 +906,7 @@ class TestStats:
             "messages_received",
             "callback_errors",
             "reconnect_count",
+            "reconnect_epoch",
             "last_connect_ts",
             "last_disconnect_ts",
         }
