@@ -480,11 +480,12 @@ stateDiagram-v2
 
 ---
 
-### Phase 5: Feed Integrity & Silent Gap Mitigation — Planned
+### Phase 5: Feed Integrity & Silent Gap Mitigation — Complete
 
 **Branch:** `feature/phase5-feed-integrity`
 **Plan:** `docs/plan/low-latency-mqtt-feed-adapter/phase5-feed-integrity.md`
-**Status:** Planned
+**Status:** Complete
+**Completed:** 2026-02-16
 
 **Goal:** Detect and mitigate operational risk caused by snapshot-based stream without sequence IDs.
 
@@ -763,33 +764,33 @@ The ❌ is explicitly documented — this is correct engineering honesty.
 
 **Functional Requirements:**
 
-- [ ] All events include `recv_mono_ns` field captured via `time.perf_counter_ns()`
-- [ ] `FeedHealthMonitor` detects stale feeds per symbol using **monotonic timestamps only** (never wall clock)
-- [ ] `connection_epoch` increments on every MQTT reconnect
-- [ ] All events include `connection_epoch` field
-- [ ] `dispatcher.health()` returns EMA-based drop-rate and queue utilization metrics
-- [ ] EMA drop-rate uses alpha=0.01 (~100-message half-life)
-- [ ] `is_auction()` helper method returns true for ATO/ATC periods
-- [ ] Strategy guard rail example demonstrates reconnect handling and stale feed detection
-- [ ] README clearly documents protocol limitations (no sequence IDs, no replay) and monotonic timestamp requirement
+- [x] All events include `recv_mono_ns` field captured via `time.perf_counter_ns()`
+- [x] `FeedHealthMonitor` detects stale feeds per symbol using **monotonic timestamps only** (never wall clock)
+- [x] `connection_epoch` increments on every MQTT reconnect
+- [x] All events include `connection_epoch` field
+- [x] `dispatcher.health()` returns EMA-based drop-rate and queue utilization metrics
+- [x] EMA drop-rate uses alpha=0.01 (~100-message half-life)
+- [x] `is_auction()` helper method returns true for ATO/ATC periods
+- [x] Strategy guard rail example demonstrates reconnect handling and stale feed detection
+- [x] README clearly documents protocol limitations (no sequence IDs, no replay) and monotonic timestamp requirement
 
 **Architectural Requirements:**
 
-- [ ] No locks added to hot path (minimal latency impact)
-- [ ] EMA update is O(1) with no memory growth (single float per dispatcher)
-- [ ] Monotonic timestamps prevent NTP-related false positives
-- [ ] Per-symbol tracking (supports multi-symbol strategies)
-- [ ] Explicit signal exposure (no hidden enforcement logic)
-- [ ] Time-based detection only (honest about capabilities)
+- [x] No locks added to hot path (minimal latency impact)
+- [x] EMA update is O(1) with no memory growth (single float per dispatcher)
+- [x] Monotonic timestamps prevent NTP-related false positives
+- [x] Per-symbol tracking (supports multi-symbol strategies)
+- [x] Explicit signal exposure (no hidden enforcement logic)
+- [x] Time-based detection only (honest about capabilities)
 
 **Testing Requirements:**
 
-- [ ] Unit tests for `FeedHealthMonitor` with monotonic time manipulation (mock `time.perf_counter_ns()`)
-- [ ] Unit tests for EMA drop-rate calculation with known sequences (verify alpha=0.01 decay)
-- [ ] Unit tests for `is_auction()` helper with different flag combinations
-- [ ] Integration test simulating reconnect and verifying epoch increment
-- [ ] Integration test simulating stale feed and verifying detection
-- [ ] Test that wall clock jump does NOT trigger false stale detection (monotonic timestamp isolation)
+- [x] Unit tests for `FeedHealthMonitor` with monotonic time manipulation (mock `time.perf_counter_ns()`)
+- [x] Unit tests for EMA drop-rate calculation with known sequences (verify alpha=0.01 decay)
+- [x] Unit tests for `is_auction()` helper with different flag combinations
+- [x] Integration test simulating reconnect and verifying epoch increment
+- [x] Integration test simulating stale feed and verifying detection
+- [x] Test that wall clock jump does NOT trigger false stale detection (monotonic timestamp isolation)
 
 ---
 
