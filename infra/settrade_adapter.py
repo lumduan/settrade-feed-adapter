@@ -250,15 +250,20 @@ class BidOfferAdapter:
         stores subscriptions and replays them on reconnect.
 
         Args:
-            symbol: Stock symbol to subscribe to (e.g., ``"AOT"``).
-                Must be non-empty.
+            symbol: Stock symbol to subscribe to (e.g., ``"AOT"`` or ``"aot"``).
+                Automatically converted to uppercase. Must be non-empty.
 
         Example:
             >>> adapter.subscribe("AOT")
-            >>> adapter.subscribe("PTT")
+            >>> adapter.subscribe("ptt")  # Converted to "PTT"
             >>> "AOT" in adapter.subscribed_symbols
             True
+            >>> "PTT" in adapter.subscribed_symbols
+            True
         """
+        # Normalize symbol to uppercase
+        symbol = symbol.upper()
+
         with self._sub_lock:
             if symbol in self._subscribed_symbols:
                 logger.debug(
@@ -278,13 +283,18 @@ class BidOfferAdapter:
         Must be called from the main thread only.
 
         Args:
-            symbol: Stock symbol to unsubscribe from (e.g., ``"AOT"``).
+            symbol: Stock symbol to unsubscribe from (e.g., ``"AOT"`` or ``"aot"``).  
+                Automatically converted to uppercase.
 
         Example:
             >>> adapter.unsubscribe("AOT")
             >>> "AOT" in adapter.subscribed_symbols
             False
+            >>> adapter.unsubscribe("ptt")  # Converted to "PTT"
         """
+        # Normalize symbol to uppercase
+        symbol = symbol.upper()
+
         with self._sub_lock:
             self._subscribed_symbols.discard(symbol)
 
