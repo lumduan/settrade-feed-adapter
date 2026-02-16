@@ -165,6 +165,70 @@ class TestMQTTClientConfig:
                 token_refresh_before_exp_seconds=5,
             )
 
+    def test_app_secret_padding_not_needed(self) -> None:
+        """App secret with correct length (divisible by 4) passes through unchanged."""
+        # 44 chars = 11*4, already properly padded
+        secret: str = "YzByIS0IlcXjdZQcCb1NaGVsbG8gd29ybGQxMjM0"
+        cfg: MQTTClientConfig = MQTTClientConfig(
+            app_id="a",
+            app_secret=secret,
+            app_code="c",
+            broker_id="b",
+        )
+        assert cfg.app_secret == secret
+        assert len(cfg.app_secret) % 4 == 0
+
+    def test_app_secret_padding_one_char(self) -> None:
+        """App secret with length % 4 == 3 gets one '=' padding."""
+        # 43 chars, needs 1 padding
+        secret: str = "YzByIS0IlcXjdZQcCb1NaGVsbG8gd29ybGQxMjM"
+        cfg: MQTTClientConfig = MQTTClientConfig(
+            app_id="a",
+            app_secret=secret,
+            app_code="c",
+            broker_id="b",
+        )
+        assert cfg.app_secret == secret + "="
+        assert len(cfg.app_secret) % 4 == 0
+
+    def test_app_secret_padding_two_chars(self) -> None:
+        """App secret with length % 4 == 2 gets two '==' padding."""
+        # 42 chars, needs 2 padding
+        secret: str = "YzByIS0IlcXjdZQcCb1NaGVsbG8gd29ybGQxMj"
+        cfg: MQTTClientConfig = MQTTClientConfig(
+            app_id="a",
+            app_secret=secret,
+            app_code="c",
+            broker_id="b",
+        )
+        assert cfg.app_secret == secret + "=="
+        assert len(cfg.app_secret) % 4 == 0
+
+    def test_app_secret_padding_three_chars(self) -> None:
+        """App secret with length % 4 == 1 gets three '===' padding."""
+        # 41 chars, needs 3 padding
+        secret: str = "YzByIS0IlcXjdZQcCb1NaGVsbG8gd29ybGQxM"
+        cfg: MQTTClientConfig = MQTTClientConfig(
+            app_id="a",
+            app_secret=secret,
+            app_code="c",
+            broker_id="b",
+        )
+        assert cfg.app_secret == secret + "==="
+        assert len(cfg.app_secret) % 4 == 0
+
+    def test_app_secret_whitespace_trimming(self) -> None:
+        """Leading/trailing whitespace is removed from app_secret."""
+        secret: str = "  YzByIS0IlcXjdZQcCb1NaGVsbG8gd29ybGQxMjM0  "
+        cfg: MQTTClientConfig = MQTTClientConfig(
+            app_id="a",
+            app_secret=secret,
+            app_code="c",
+            broker_id="b",
+        )
+        assert cfg.app_secret == "YzByIS0IlcXjdZQcCb1NaGVsbG8gd29ybGQxMjM0"
+        assert cfg.app_secret.strip() == cfg.app_secret
+
 
 # ---------------------------------------------------------------------------
 # State Machine Tests

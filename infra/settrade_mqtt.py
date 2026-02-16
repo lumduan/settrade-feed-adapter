@@ -32,7 +32,7 @@ from enum import Enum
 from typing import Callable
 
 import paho.mqtt.client as mqtt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from settrade_v2.context import Context, Option
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -130,6 +130,44 @@ class MQTTClientConfig(BaseModel):
         ge=10,
         description="Seconds before token expiry to trigger controlled reconnect",
     )
+
+    @field_validator("app_secret")
+    @classmethod
+    def _validate_base64_padding(cls, v: str) -> str:
+        """Ensure app_secret has proper base64 padding.
+
+        The Settrade API console may provide app_secret without proper
+        base64 padding characters ('='). This validator automatically
+        adds the required padding to prevent 'Incorrect padding' errors
+        during SDK authentication.
+
+        Args:
+            v: The app_secret string from user configuration.
+
+        Returns:
+            The app_secret with proper base64 padding added if needed.
+
+        Note:
+            Base64 strings must have length divisible by 4. This validator
+            adds the minimum number of '=' padding characters needed.
+        """
+        if not v:
+            return v
+
+        # Remove any whitespace
+        v = v.strip()
+
+        # Calculate padding needed
+        padding_needed: int = (4 - len(v) % 4) % 4
+
+        if padding_needed > 0:
+            logger.debug(
+                "Auto-padding app_secret: added %d padding character(s)",
+                padding_needed,
+            )
+            v = v + "=" * padding_needed
+
+        return v
 
 
 # ---------------------------------------------------------------------------

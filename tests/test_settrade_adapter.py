@@ -294,6 +294,85 @@ class TestSubscription:
         symbols: frozenset[str] = adapter.subscribed_symbols
         assert isinstance(symbols, frozenset)
 
+    def test_subscribe_lowercase_converted_to_uppercase(
+        self,
+        adapter: BidOfferAdapter,
+        mock_mqtt_client: MagicMock,
+    ) -> None:
+        """Lowercase symbol is automatically converted to uppercase."""
+        adapter.subscribe("aot")
+        assert "AOT" in adapter.subscribed_symbols
+        assert "aot" not in adapter.subscribed_symbols
+        mock_mqtt_client.subscribe.assert_called_once_with(
+            topic="proto/topic/bidofferv3/AOT",
+            callback=adapter._on_message,
+        )
+
+    def test_subscribe_mixed_case_converted_to_uppercase(
+        self,
+        adapter: BidOfferAdapter,
+        mock_mqtt_client: MagicMock,
+    ) -> None:
+        """Mixed-case symbol is automatically converted to uppercase."""
+        adapter.subscribe("PtT")
+        assert "PTT" in adapter.subscribed_symbols
+        assert "PtT" not in adapter.subscribed_symbols
+        mock_mqtt_client.subscribe.assert_called_once_with(
+            topic="proto/topic/bidofferv3/PTT",
+            callback=adapter._on_message,
+        )
+
+    def test_subscribe_already_uppercase_unchanged(
+        self,
+        adapter: BidOfferAdapter,
+        mock_mqtt_client: MagicMock,
+    ) -> None:
+        """Uppercase symbol remains unchanged."""
+        adapter.subscribe("VGI")
+        assert "VGI" in adapter.subscribed_symbols
+        mock_mqtt_client.subscribe.assert_called_once_with(
+            topic="proto/topic/bidofferv3/VGI",
+            callback=adapter._on_message,
+        )
+
+    def test_subscribe_lowercase_duplicate_handled_correctly(
+        self,
+        adapter: BidOfferAdapter,
+        mock_mqtt_client: MagicMock,
+    ) -> None:
+        """Subscribing lowercase then uppercase is treated as duplicate."""
+        adapter.subscribe("aot")
+        adapter.subscribe("AOT")
+        # Both resolve to "AOT", so only one MQTT subscription
+        assert mock_mqtt_client.subscribe.call_count == 1
+        assert adapter.subscribed_symbols == frozenset({"AOT"})
+
+    def test_unsubscribe_lowercase_converted_to_uppercase(
+        self,
+        adapter: BidOfferAdapter,
+        mock_mqtt_client: MagicMock,
+    ) -> None:
+        """Unsubscribe with lowercase symbol works correctly."""
+        adapter.subscribe("AOT")
+        adapter.unsubscribe("aot")  # Lowercase
+        assert "AOT" not in adapter.subscribed_symbols
+        mock_mqtt_client.unsubscribe.assert_called_once_with(
+            topic="proto/topic/bidofferv3/AOT",
+        )
+
+    def test_unsubscribe_mixed_case_converted_to_uppercase(
+        self,
+        adapter: BidOfferAdapter,
+        mock_mqtt_client: MagicMock,
+    ) -> None:
+        """Unsubscribe with mixed-case symbol works correctly."""
+        adapter.subscribe("PTT")
+        adapter.unsubscribe("pTt")  # Mixed case
+        assert "PTT" not in adapter.subscribed_symbols
+        mock_mqtt_client.unsubscribe.assert_called_once_with(
+            topic="proto/topic/bidofferv3/PTT",
+        )
+
 
 # ---------------------------------------------------------------------------
 # BestBidAsk Parsing Tests
