@@ -18,6 +18,12 @@ Timestamp convention:
     - ``recv_mono_ns``: ``time.perf_counter_ns()`` monotonic — for
       latency measurement. Never goes backwards.
 
+Connection epoch:
+    Each event carries a ``connection_epoch`` field (default 0) that
+    increments on every MQTT reconnect. Strategy code can detect
+    reconnects by comparing ``event.connection_epoch != last_epoch``
+    and take appropriate action (clear state, cancel orders, etc.).
+
 Float precision contract:
     Prices are stored as IEEE 754 ``float`` (15-17 significant digits).
     Downstream strategy code MUST compare prices using tolerance
@@ -41,6 +47,10 @@ Example:
     'AOT'
     >>> event.bid_flag == BidAskFlag.NORMAL
     True
+    >>> event.is_auction()
+    False
+    >>> event.connection_epoch
+    0
 """
 
 from enum import IntEnum
@@ -57,8 +67,8 @@ class BidAskFlag(IntEnum):
     """Market session flag for bid/ask prices.
 
     Mirrors ``BidOfferV3BidAskFlag`` from the Settrade protobuf schema.
-    Using IntEnum allows direct comparison with ``int`` values stored
-    in event models (e.g., ``event.bid_flag == BidAskFlag.NORMAL``).
+    Using IntEnum allows direct comparison with ``int`` values and
+    seamless use in Pydantic models with automatic int-to-enum coercion.
 
     Attributes:
         UNDEFINED: Default/unknown flag (protobuf default value).
@@ -80,6 +90,35 @@ class BidAskFlag(IntEnum):
 
 
 # ---------------------------------------------------------------------------
+# Shared auction detection logic
+# ---------------------------------------------------------------------------
+
+_AUCTION_FLAGS: tuple[BidAskFlag, ...] = (BidAskFlag.ATO, BidAskFlag.ATC)
+"""Flags that indicate an auction period. Used by ``is_auction()``."""
+
+
+def _is_auction(bid_flag: int, ask_flag: int) -> bool:
+    """Shared auction detection logic for event models.
+
+    Returns ``True`` if either bid or ask flag indicates an auction
+    session (At-The-Opening or At-The-Close).
+
+    Uses :data:`_AUCTION_FLAGS` tuple for clarity — no magic numbers.
+    Works with both ``BidAskFlag`` enum values and raw ``int`` values
+    (important for ``model_construct()`` hot path where validation is
+    skipped and flags may be stored as plain ``int``).
+
+    Args:
+        bid_flag: Bid session flag value.
+        ask_flag: Ask session flag value.
+
+    Returns:
+        ``True`` if either flag is ATO (2) or ATC (3).
+    """
+    return bid_flag in _AUCTION_FLAGS or ask_flag in _AUCTION_FLAGS
+
+
+# ---------------------------------------------------------------------------
 # Event Models
 # ---------------------------------------------------------------------------
 
@@ -96,6 +135,14 @@ class BestBidAsk(BaseModel):
         skip Pydantic validation. Regular ``BestBidAsk(...)``
         construction is safe for tests and external data.
 
+    Note on ``model_construct()`` and flag types:
+        When using ``model_construct()``, Pydantic validation is
+        skipped, so ``bid_flag``/``ask_flag`` may be stored as plain
+        ``int`` rather than ``BidAskFlag``. This is safe because
+        ``IntEnum`` comparison works with ``int`` values
+        (``2 in (BidAskFlag.ATO, BidAskFlag.ATC)`` is ``True``).
+        Regular construction auto-coerces ``int`` → ``BidAskFlag``.
+
     Attributes:
         symbol: Stock symbol (e.g., ``"AOT"``). Non-empty.
         bid: Best bid price converted from ``Money(units, nanos)``
@@ -111,6 +158,9 @@ class BestBidAsk(BaseModel):
         recv_mono_ns: Monotonic timestamp (``time.perf_counter_ns()``)
             captured at MQTT message receive. For latency measurement.
             Never goes backwards. Non-negative.
+        connection_epoch: Reconnect version counter. 0 = initial
+            connection. Increments on each MQTT reconnect after
+            subscription replay.
 
     Example:
         >>> event = BestBidAsk(
@@ -119,13 +169,15 @@ class BestBidAsk(BaseModel):
         ...     ask=26.0,
         ...     bid_vol=1000,
         ...     ask_vol=500,
-        ...     bid_flag=1,
-        ...     ask_flag=1,
+        ...     bid_flag=BidAskFlag.NORMAL,
+        ...     ask_flag=BidAskFlag.NORMAL,
         ...     recv_ts=1739500000000000000,
         ...     recv_mono_ns=123456789,
         ... )
         >>> event.bid
         25.5
+        >>> event.bid_flag == BidAskFlag.NORMAL
+        True
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -139,15 +191,11 @@ class BestBidAsk(BaseModel):
     )
     bid_vol: int = Field(ge=0, description="Best bid volume (number of shares)")
     ask_vol: int = Field(ge=0, description="Best ask volume (number of shares)")
-    bid_flag: int = Field(
-        ge=0,
-        le=3,
-        description="Bid session flag: 0=UNDEFINED, 1=NORMAL, 2=ATO, 3=ATC",
+    bid_flag: BidAskFlag = Field(
+        description="Bid session flag. See BidAskFlag enum.",
     )
-    ask_flag: int = Field(
-        ge=0,
-        le=3,
-        description="Ask session flag: 0=UNDEFINED, 1=NORMAL, 2=ATO, 3=ATC",
+    ask_flag: BidAskFlag = Field(
+        description="Ask session flag. See BidAskFlag enum.",
     )
     recv_ts: int = Field(
         ge=0,
@@ -157,6 +205,36 @@ class BestBidAsk(BaseModel):
         ge=0,
         description="Monotonic receive timestamp (time.perf_counter_ns())",
     )
+    connection_epoch: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Reconnect version counter. Increments on each MQTT reconnect "
+            "after subscription replay. 0 = initial connection."
+        ),
+    )
+
+    def is_auction(self) -> bool:
+        """Check if this event occurred during an auction period (ATO/ATC).
+
+        Uses :class:`BidAskFlag` enum for clarity — no magic numbers.
+        Returns ``True`` if either bid or ask flag indicates an auction
+        session (At-The-Opening or At-The-Close).
+
+        Returns:
+            ``True`` if bid_flag or ask_flag is ATO (2) or ATC (3).
+
+        Example:
+            >>> event = BestBidAsk(
+            ...     symbol="AOT", bid=0.0, ask=0.0,
+            ...     bid_vol=0, ask_vol=0,
+            ...     bid_flag=BidAskFlag.ATO, ask_flag=BidAskFlag.ATO,
+            ...     recv_ts=0, recv_mono_ns=0,
+            ... )
+            >>> event.is_auction()
+            True
+        """
+        return _is_auction(self.bid_flag, self.ask_flag)
 
 
 class FullBidOffer(BaseModel):
@@ -189,6 +267,9 @@ class FullBidOffer(BaseModel):
         recv_ts: Wall-clock timestamp (``time.time_ns()``). Non-negative.
         recv_mono_ns: Monotonic timestamp (``time.perf_counter_ns()``).
             Non-negative.
+        connection_epoch: Reconnect version counter. 0 = initial
+            connection. Increments on each MQTT reconnect after
+            subscription replay.
 
     Example:
         >>> event = FullBidOffer(
@@ -197,8 +278,8 @@ class FullBidOffer(BaseModel):
         ...     ask_prices=(26.0, 26.25, 26.5, 0, 0, 0, 0, 0, 0, 0),
         ...     bid_volumes=(1000, 500, 200, 0, 0, 0, 0, 0, 0, 0),
         ...     ask_volumes=(800, 300, 100, 0, 0, 0, 0, 0, 0, 0),
-        ...     bid_flag=1,
-        ...     ask_flag=1,
+        ...     bid_flag=BidAskFlag.NORMAL,
+        ...     ask_flag=BidAskFlag.NORMAL,
         ...     recv_ts=1739500000000000000,
         ...     recv_mono_ns=123456789,
         ... )
@@ -229,15 +310,11 @@ class FullBidOffer(BaseModel):
         max_length=10,
         description="Exactly 10 ask volumes (number of shares).",
     )
-    bid_flag: int = Field(
-        ge=0,
-        le=3,
-        description="Bid session flag: 0=UNDEFINED, 1=NORMAL, 2=ATO, 3=ATC",
+    bid_flag: BidAskFlag = Field(
+        description="Bid session flag. See BidAskFlag enum.",
     )
-    ask_flag: int = Field(
-        ge=0,
-        le=3,
-        description="Ask session flag: 0=UNDEFINED, 1=NORMAL, 2=ATO, 3=ATC",
+    ask_flag: BidAskFlag = Field(
+        description="Ask session flag. See BidAskFlag enum.",
     )
     recv_ts: int = Field(
         ge=0,
@@ -247,3 +324,23 @@ class FullBidOffer(BaseModel):
         ge=0,
         description="Monotonic receive timestamp (time.perf_counter_ns())",
     )
+    connection_epoch: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Reconnect version counter. Increments on each MQTT reconnect "
+            "after subscription replay. 0 = initial connection."
+        ),
+    )
+
+    def is_auction(self) -> bool:
+        """Check if this event occurred during an auction period (ATO/ATC).
+
+        Uses :class:`BidAskFlag` enum for clarity — no magic numbers.
+        Returns ``True`` if either bid or ask flag indicates an auction
+        session (At-The-Opening or At-The-Close).
+
+        Returns:
+            ``True`` if bid_flag or ask_flag is ATO (2) or ATC (3).
+        """
+        return _is_auction(self.bid_flag, self.ask_flag)

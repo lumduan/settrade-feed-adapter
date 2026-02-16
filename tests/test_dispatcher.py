@@ -11,7 +11,12 @@ import threading
 import pytest
 from pydantic import ValidationError
 
-from core.dispatcher import Dispatcher, DispatcherConfig, DispatcherStats
+from core.dispatcher import (
+    Dispatcher,
+    DispatcherConfig,
+    DispatcherHealth,
+    DispatcherStats,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -729,3 +734,198 @@ class TestStress:
         # Remaining events should be the last `maxlen` items
         events: list[int] = dispatcher.poll(max_events=maxlen)
         assert events == list(range(total - maxlen, total))
+
+
+# ---------------------------------------------------------------------------
+# DispatcherConfig EMA Tests
+# ---------------------------------------------------------------------------
+
+
+class TestDispatcherConfigEMA:
+    """Tests for EMA-related DispatcherConfig fields."""
+
+    def test_default_ema_alpha(self) -> None:
+        """Default ema_alpha is 0.01."""
+        config: DispatcherConfig = DispatcherConfig()
+        assert config.ema_alpha == 0.01
+
+    def test_default_drop_warning_threshold(self) -> None:
+        """Default drop_warning_threshold is 0.01."""
+        config: DispatcherConfig = DispatcherConfig()
+        assert config.drop_warning_threshold == 0.01
+
+    def test_custom_ema_alpha(self) -> None:
+        """Custom ema_alpha is accepted."""
+        config: DispatcherConfig = DispatcherConfig(ema_alpha=0.1)
+        assert config.ema_alpha == 0.1
+
+    def test_ema_alpha_zero_rejected(self) -> None:
+        """ema_alpha=0 is rejected (gt=0)."""
+        with pytest.raises(ValidationError):
+            DispatcherConfig(ema_alpha=0.0)
+
+    def test_ema_alpha_above_one_rejected(self) -> None:
+        """ema_alpha > 1.0 is rejected (le=1)."""
+        with pytest.raises(ValidationError):
+            DispatcherConfig(ema_alpha=1.5)
+
+    def test_threshold_zero_rejected(self) -> None:
+        """drop_warning_threshold=0 is rejected."""
+        with pytest.raises(ValidationError):
+            DispatcherConfig(drop_warning_threshold=0.0)
+
+
+# ---------------------------------------------------------------------------
+# DispatcherHealth Model Tests
+# ---------------------------------------------------------------------------
+
+
+class TestDispatcherHealth:
+    """Tests for DispatcherHealth Pydantic model."""
+
+    def test_creation(self) -> None:
+        """DispatcherHealth model is created with valid data."""
+        health: DispatcherHealth = DispatcherHealth(
+            drop_rate_ema=0.05,
+            queue_utilization=0.5,
+            total_dropped=10,
+            total_pushed=200,
+        )
+        assert health.drop_rate_ema == 0.05
+        assert health.queue_utilization == 0.5
+        assert health.total_dropped == 10
+        assert health.total_pushed == 200
+
+    def test_frozen_immutability(self) -> None:
+        """Frozen model rejects attribute assignment."""
+        health: DispatcherHealth = DispatcherHealth(
+            drop_rate_ema=0.0,
+            queue_utilization=0.0,
+            total_dropped=0,
+            total_pushed=0,
+        )
+        with pytest.raises(ValidationError):
+            health.drop_rate_ema = 1.0  # type: ignore[misc]
+
+    def test_extra_fields_rejected(self) -> None:
+        """Extra fields are rejected."""
+        with pytest.raises(ValidationError):
+            DispatcherHealth(
+                drop_rate_ema=0.0,
+                queue_utilization=0.0,
+                total_dropped=0,
+                total_pushed=0,
+                extra="bad",  # type: ignore[call-arg]
+            )
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher Health & EMA Tests
+# ---------------------------------------------------------------------------
+
+
+class TestDispatcherEMAHealth:
+    """Tests for EMA drop-rate tracking and health() method."""
+
+    def test_health_initial_state(self) -> None:
+        """health() returns zero state on fresh dispatcher."""
+        dispatcher: Dispatcher[str] = Dispatcher()
+        health: DispatcherHealth = dispatcher.health()
+        assert health.drop_rate_ema == 0.0
+        assert health.queue_utilization == 0.0
+        assert health.total_dropped == 0
+        assert health.total_pushed == 0
+
+    def test_health_after_push_no_drop(self) -> None:
+        """EMA stays near 0 with no drops."""
+        dispatcher: Dispatcher[int] = Dispatcher(
+            config=DispatcherConfig(maxlen=100),
+        )
+        for i in range(50):
+            dispatcher.push(i)
+        health: DispatcherHealth = dispatcher.health()
+        assert health.drop_rate_ema == pytest.approx(0.0, abs=1e-10)
+        assert health.total_dropped == 0
+        assert health.total_pushed == 50
+
+    def test_health_ema_rises_on_drops(self) -> None:
+        """EMA rises when drops occur."""
+        dispatcher: Dispatcher[int] = Dispatcher(
+            config=DispatcherConfig(maxlen=2, ema_alpha=0.5),
+        )
+        dispatcher.push(1)
+        dispatcher.push(2)
+        # Queue full — next push drops
+        dispatcher.push(3)
+        health: DispatcherHealth = dispatcher.health()
+        assert health.drop_rate_ema > 0.0
+        assert health.total_dropped == 1
+
+    def test_health_ema_decays_without_drops(self) -> None:
+        """EMA decays back toward 0 when no drops occur."""
+        dispatcher: Dispatcher[int] = Dispatcher(
+            config=DispatcherConfig(maxlen=2, ema_alpha=0.5),
+        )
+        # Fill and drop
+        dispatcher.push(1)
+        dispatcher.push(2)
+        dispatcher.push(3)  # drop
+        ema_after_drop: float = dispatcher.health().drop_rate_ema
+
+        # Poll to free space, then push without drops (large maxlen)
+        dispatcher.poll(max_events=10)
+        # After poll, queue is empty (0/2), so 20 pushes into maxlen=2
+        # will cause 18 drops. Instead, just poll between pushes.
+        for _ in range(20):
+            dispatcher.poll(max_events=10)
+            dispatcher.push(0)
+        ema_after_recovery: float = dispatcher.health().drop_rate_ema
+        assert ema_after_recovery < ema_after_drop
+
+    def test_health_queue_utilization(self) -> None:
+        """queue_utilization reflects current fill ratio."""
+        dispatcher: Dispatcher[int] = Dispatcher(
+            config=DispatcherConfig(maxlen=100),
+        )
+        for i in range(50):
+            dispatcher.push(i)
+        health: DispatcherHealth = dispatcher.health()
+        assert health.queue_utilization == pytest.approx(0.5)
+
+    def test_health_returns_frozen_model(self) -> None:
+        """health() returns a frozen DispatcherHealth model."""
+        dispatcher: Dispatcher[str] = Dispatcher()
+        health: DispatcherHealth = dispatcher.health()
+        assert isinstance(health, DispatcherHealth)
+
+    def test_clear_resets_ema(self) -> None:
+        """clear() resets EMA to 0."""
+        dispatcher: Dispatcher[int] = Dispatcher(
+            config=DispatcherConfig(maxlen=2, ema_alpha=0.5),
+        )
+        dispatcher.push(1)
+        dispatcher.push(2)
+        dispatcher.push(3)  # drop
+        assert dispatcher.health().drop_rate_ema > 0.0
+
+        dispatcher.clear()
+        assert dispatcher.health().drop_rate_ema == 0.0
+
+    def test_ema_alpha_configurable(self) -> None:
+        """Different alpha values produce different EMA responses."""
+        # High alpha → faster response
+        d_fast: Dispatcher[int] = Dispatcher(
+            config=DispatcherConfig(maxlen=1, ema_alpha=0.9),
+        )
+        d_fast.push(1)
+        d_fast.push(2)  # drop
+
+        # Low alpha → slower response
+        d_slow: Dispatcher[int] = Dispatcher(
+            config=DispatcherConfig(maxlen=1, ema_alpha=0.01),
+        )
+        d_slow.push(1)
+        d_slow.push(2)  # drop
+
+        # Higher alpha → higher EMA after single drop
+        assert d_fast.health().drop_rate_ema > d_slow.health().drop_rate_ema

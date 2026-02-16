@@ -251,6 +251,11 @@ class SettradeMQTTClient:
         self._reconnect_count: int = 0
         self._counter_lock: threading.Lock = threading.Lock()
 
+        # Reconnect epoch — incremented after subscription replay on
+        # reconnect (not initial connect). Stays 0 for initial connection.
+        # Strategy can detect reconnects by comparing event.connection_epoch.
+        self._reconnect_epoch: int = 0
+
         # Timestamps
         self._last_connect_ts: float = 0.0
         self._last_disconnect_ts: float = 0.0
@@ -270,6 +275,21 @@ class SettradeMQTTClient:
         """Current connection state."""
         with self._state_lock:
             return self._state
+
+    @property
+    def reconnect_epoch(self) -> int:
+        """Reconnect version counter.
+
+        Returns 0 for initial connection. Increments by 1 on each
+        successful reconnect **after** all subscriptions have been
+        replayed. Strategy code can use this to detect reconnects:
+
+            if event.connection_epoch != last_seen_epoch:
+                handle_reconnect()
+
+        Thread-safe: reads an int (CPython atomic).
+        """
+        return self._reconnect_epoch
 
     def connect(self) -> None:
         """Login, fetch dispatcher token, and connect to MQTT broker.
@@ -409,6 +429,7 @@ class SettradeMQTTClient:
             "messages_received": msgs,
             "callback_errors": errs,
             "reconnect_count": reconns,
+            "reconnect_epoch": self._reconnect_epoch,
             "last_connect_ts": self._last_connect_ts,
             "last_disconnect_ts": self._last_disconnect_ts,
         }
@@ -568,6 +589,10 @@ class SettradeMQTTClient:
             rc: Connection result code (0 = success).
         """
         if rc == 0:
+            # Detect reconnect BEFORE updating timestamp.
+            # _last_connect_ts == 0 means this is the initial connect.
+            is_reconnect: bool = self._last_connect_ts > 0
+
             with self._state_lock:
                 self._state = ClientState.CONNECTED
             self._last_connect_ts = time.time()
@@ -579,6 +604,15 @@ class SettradeMQTTClient:
             for topic in topics:
                 client.subscribe(topic=topic)
                 logger.info("Replayed subscription: %s", topic)
+
+            # Increment reconnect epoch AFTER subscription replay,
+            # only for reconnects (not initial connect).
+            if is_reconnect:
+                self._reconnect_epoch += 1
+                logger.info(
+                    "Reconnect epoch incremented to %d",
+                    self._reconnect_epoch,
+                )
         else:
             logger.error("MQTT connection failed (rc=%d)", rc)
             self._schedule_reconnect()

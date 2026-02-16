@@ -251,7 +251,7 @@ If you need exchange-level sequencing, consider direct exchange connectivity or 
 
 ---
 
-## Feed Health Monitoring (Recommended)
+## Feed Health Monitoring
 
 ### Why You Need This
 
@@ -259,67 +259,104 @@ Because this is a **snapshot feed without sequence IDs**, production trading sys
 
 - **Feed liveness detection** — Detect stale feed (max inter-event gap)
 - **Reconnect detection** — Detect when the adapter reconnects (events may have been missed)
+- **Drop-rate monitoring** — Detect when the dispatcher is dropping events
 - **Strategy guard rails** — Block trading decisions when feed becomes stale
 
-**This adapter intentionally does not embed trading logic** — feed health monitoring is your responsibility.
+**This adapter exposes health signals but does not enforce trading decisions** — your strategy decides what to do.
 
-### Recommended Pattern
+### Where Drops Can Happen
+
+```text
+MQTT Broker (QoS 0)
+    │
+    │  ← ❶ Network / QoS 0 drop (undetectable)
+    │
+    ▼
+SettradeMQTTClient
+    │ on_message(payload)
+    │  ← ❷ Parse error → event lost (counted in adapter stats)
+    ▼
+BidOfferAdapter
+    │ on_event(event)
+    │  ← ❸ Dispatcher full → oldest evicted (counted in health())
+    ▼
+Dispatcher[BestBidAsk]     ← health().drop_rate_ema
+    │ poll(max_events=N)
+    │  ← ❹ Strategy too slow → events age in queue
+    ▼
+Strategy Loop              ← FeedHealthMonitor.is_stale()
+```
+
+### Built-in Health Components
+
+The adapter provides two health components:
+
+**`FeedHealthMonitor`** — Two-tier feed liveness detection:
+
+- **Global:** `is_feed_dead()` — entire MQTT connection appears dead
+- **Per-symbol:** `is_stale(symbol)` — specific symbol data is stale
+- Uses **monotonic time only** (`perf_counter_ns`) — NTP-immune
+- Startup-aware: returns `False` before first event (unknown ≠ dead)
+- Per-symbol gap override for illiquid symbols
+
+**`Dispatcher.health()`** — EMA-smoothed drop rate:
+
+- `drop_rate_ema` — smoothed drop rate (0.0 = no drops)
+- `queue_utilization` — current queue fill ratio
+- Lifetime counters: `total_dropped`, `total_pushed`
+
+### Production Guard Rail Pattern
 
 ```python
-import time
-from typing import Optional
+from core.dispatcher import Dispatcher, DispatcherConfig, DispatcherHealth
+from core.events import BestBidAsk
+from core.feed_health import FeedHealthConfig, FeedHealthMonitor
 
-class FeedHealthMonitor:
-    """Simple time-based feed health monitor."""
-    
-    def __init__(self, max_gap_seconds: float = 5.0):
-        self.max_gap_seconds = max_gap_seconds
-        self.last_event_time: Optional[float] = None
-        self.is_stale = False
-    
-    def on_event(self, event) -> None:
-        """Call this every time you receive an event."""
-        self.last_event_time = time.time()
-        self.is_stale = False
-    
-    def check_health(self) -> bool:
-        """Returns False if feed is stale."""
-        if self.last_event_time is None:
-            return False  # No data yet
-        
-        gap = time.time() - self.last_event_time
-        if gap > self.max_gap_seconds:
-            self.is_stale = True
-            return False
-        
-        return True
+monitor = FeedHealthMonitor(
+    config=FeedHealthConfig(
+        max_gap_seconds=5.0,
+        per_symbol_max_gap={"RARE": 60.0},  # illiquid override
+    ),
+)
 
-# Usage in strategy loop
-feed_monitor = FeedHealthMonitor(max_gap_seconds=5.0)
+last_epoch: int | None = None
 
 while True:
     events = dispatcher.poll(max_events=100)
-    
+    now_ns = time.perf_counter_ns()  # capture once per loop
+
     for event in events:
-        feed_monitor.on_event(event)
-        
-        # Guard rail: skip trading decisions if feed is stale
-        if not feed_monitor.check_health():
-            print("WARNING: Feed is stale, skipping trading decision")
-            continue
-        
-        # Safe to make trading decisions
-        process_event(event)
+        monitor.on_event(event.symbol, now_ns=now_ns)
+
+        # Guard 1: Reconnect detection
+        if last_epoch is None:
+            last_epoch = event.connection_epoch
+        elif event.connection_epoch != last_epoch:
+            last_epoch = event.connection_epoch
+            # Reinitialize strategy state — data may have been missed
+
+        # Guard 2: Auction period awareness
+        if event.is_auction():
+            pass  # Skip limit orders during ATO/ATC
+
+    # Guard 3: Feed-dead detection
+    if monitor.has_ever_received() and monitor.is_feed_dead(now_ns=now_ns):
+        pass  # Pause trading — entire feed is silent
+
+    # Guard 4: Drop-rate detection
+    health: DispatcherHealth = dispatcher.health()
+    if health.drop_rate_ema > 0.01:
+        pass  # Reduce position size — queue is overflowing
 ```
+
+See `examples/example_feed_health.py` for a complete working example.
 
 ### Production Considerations
 
-For production trading systems, consider:
-
-- **Multiple symbols** — Track liveness per symbol (some symbols are illiquid)
+- **Per-symbol thresholds** — PTT ticks every ~50ms, illiquid stocks may go 30+ minutes
 - **Market hours** — Different gap thresholds during market open vs pre-open
-- **Reconnect events** — Log and alert when reconnects occur
-- **Circuit breakers** — Automatically halt trading when feed health degrades
+- **Reconnect events** — `connection_epoch` changes indicate potential data gaps
+- **Circuit breakers** — Use `is_feed_dead()` to halt trading when feed is silent
 - **Latency monitoring** — Track `recv_mono_ns` to detect feed lag
 
 ---
@@ -330,10 +367,11 @@ For production trading systems, consider:
 settrade-feed-adapter/
 ├── core/
 │   ├── events.py                # Pydantic event models: BestBidAsk, FullBidOffer
-│   ├── dispatcher.py            # Bounded deque dispatcher with backpressure
+│   ├── dispatcher.py            # Bounded deque dispatcher with EMA drop-rate
+│   ├── feed_health.py           # Two-tier feed health monitor (monotonic)
 │   └── __init__.py
 ├── infra/
-│   ├── settrade_mqtt.py         # MQTT transport (WSS + TLS + auto-reconnect)
+│   ├── settrade_mqtt.py         # MQTT transport (WSS + TLS + reconnect_epoch)
 │   ├── settrade_adapter.py      # BidOffer adapter (protobuf → event)
 │   └── __init__.py
 ├── scripts/
@@ -342,10 +380,12 @@ settrade-feed-adapter/
 │   ├── benchmark_adapter.py     # Adapter benchmark
 │   └── benchmark_compare.py     # Comparison report generator
 ├── examples/
-│   └── example_bidoffer.py      # Real-world usage with latency measurement
+│   ├── example_bidoffer.py      # Real-world usage with latency measurement
+│   └── example_feed_health.py   # Feed health monitoring with guard rails
 ├── tests/
 │   ├── test_events.py
 │   ├── test_dispatcher.py
+│   ├── test_feed_health.py
 │   ├── test_settrade_adapter.py
 │   ├── test_settrade_mqtt.py
 │   └── test_benchmark_utils.py
@@ -359,18 +399,22 @@ settrade-feed-adapter/
 
 ```text
 MQTT Broker (WSS/443)
-    │                       (snapshot stream, no replay, no sequence IDs)
+    │                        (snapshot stream, no replay, no sequence IDs)
     ▼
-SettradeMQTTClient          ← MQTT IO thread (paho loop_start)
-    │ on_message(payload)
+SettradeMQTTClient           ← MQTT IO thread (paho loop_start)
+    │ on_message(payload)       reconnect_epoch incremented on reconnect
     ▼
-BidOfferAdapter             ← Parse protobuf, normalize to BestBidAsk
+BidOfferAdapter              ← Parse protobuf, attach connection_epoch
     │ on_event(event)
     ▼
-Dispatcher[BestBidAsk]      ← Bounded deque (drop-oldest backpressure)
-    │ poll(max_events=100)
+Dispatcher[BestBidAsk]       ← Bounded deque + EMA drop-rate tracking
+    │ poll(max_events=100)      health() → drop_rate_ema, queue_utilization
     ▼
-Strategy Loop               ← Main thread consumes events
+Strategy Loop                ← Main thread consumes events
+    │                           FeedHealthMonitor.on_event(symbol)
+    ├── is_feed_dead()          Global feed silence detection
+    ├── is_stale(symbol)        Per-symbol liveness detection
+    └── connection_epoch        Reconnect-aware state management
 ```
 
 ---
@@ -473,19 +517,22 @@ except KeyboardInterrupt:
 
 ### BestBidAsk
 
-Best bid/ask (level 1) with dual timestamps:
+Best bid/ask (level 1) with dual timestamps and feed integrity fields:
 
 ```python
 class BestBidAsk(BaseModel):
     symbol: str
-    bid: float          # Best bid price (bid_price1)
-    ask: float          # Best ask price (ask_price1)
-    bid_vol: int        # Best bid volume (bid_volume1)
-    ask_vol: int        # Best ask volume (ask_volume1)
-    bid_flag: int       # 0=NONE, 1=NORMAL, 2=ATO, 3=ATC
-    ask_flag: int       # 0=NONE, 1=NORMAL, 2=ATO, 3=ATC
-    recv_ts: int        # time.time_ns() at receive (wall clock)
-    recv_mono_ns: int   # time.perf_counter_ns() (monotonic)
+    bid: float                  # Best bid price (bid_price1)
+    ask: float                  # Best ask price (ask_price1)
+    bid_vol: int                # Best bid volume (bid_volume1)
+    ask_vol: int                # Best ask volume (ask_volume1)
+    bid_flag: BidAskFlag        # UNDEFINED=0, NORMAL=1, ATO=2, ATC=3
+    ask_flag: BidAskFlag        # UNDEFINED=0, NORMAL=1, ATO=2, ATC=3
+    recv_ts: int                # time.time_ns() at receive (wall clock)
+    recv_mono_ns: int           # time.perf_counter_ns() (monotonic)
+    connection_epoch: int = 0   # Reconnect generation (0 = initial)
+
+    def is_auction(self) -> bool: ...  # True during ATO/ATC
 ```
 
 ### FullBidOffer
@@ -499,10 +546,13 @@ class FullBidOffer(BaseModel):
     ask_prices: tuple[float, ...]    # Top 10 ask prices
     bid_volumes: tuple[int, ...]     # Top 10 bid volumes
     ask_volumes: tuple[int, ...]     # Top 10 ask volumes
-    bid_flag: int
-    ask_flag: int
+    bid_flag: BidAskFlag
+    ask_flag: BidAskFlag
     recv_ts: int
     recv_mono_ns: int
+    connection_epoch: int = 0
+
+    def is_auction(self) -> bool: ...
 ```
 
 ---
@@ -525,11 +575,11 @@ python -m pytest tests/ -v --cov=core --cov=infra --cov=scripts
 
 | Directory | Purpose |
 | --- | --- |
-| `core/` | Domain layer: event models, dispatcher |
+| `core/` | Domain layer: event models, dispatcher, feed health |
 | `infra/` | Infrastructure: MQTT transport, protobuf adapter |
 | `scripts/` | Benchmark scripts and utilities |
-| `examples/` | Usage examples with latency measurement |
-| `tests/` | Unit tests (223 tests) |
+| `examples/` | Usage examples with latency and feed health |
+| `tests/` | Unit tests |
 | `docs/` | Implementation plans |
 
 ---

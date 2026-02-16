@@ -370,6 +370,7 @@ class BidOfferAdapter:
         """
         recv_ts: int = time.time_ns()
         recv_mono_ns: int = time.perf_counter_ns()
+        connection_epoch: int = self._mqtt_client.reconnect_epoch
 
         # Phase 1: Parse protobuf and create event (isolated)
         try:
@@ -379,12 +380,14 @@ class BidOfferAdapter:
                     msg=msg,
                     recv_ts=recv_ts,
                     recv_mono_ns=recv_mono_ns,
+                    connection_epoch=connection_epoch,
                 )
             else:
                 event = self._parse_best_bid_ask(
                     msg=msg,
                     recv_ts=recv_ts,
                     recv_mono_ns=recv_mono_ns,
+                    connection_epoch=connection_epoch,
                 )
         except Exception:
             self._parse_errors += 1
@@ -465,6 +468,7 @@ class BidOfferAdapter:
         msg: BidOfferV3,
         recv_ts: int,
         recv_mono_ns: int,
+        connection_epoch: int,
     ) -> BestBidAsk:
         """Extract top-of-book from BidOfferV3 into BestBidAsk.
 
@@ -476,6 +480,8 @@ class BidOfferAdapter:
             recv_ts: Wall-clock timestamp from ``time.time_ns()``.
             recv_mono_ns: Monotonic timestamp from
                 ``time.perf_counter_ns()``.
+            connection_epoch: Reconnect generation counter from
+                :attr:`SettradeMQTTClient.reconnect_epoch`.
 
         Returns:
             Normalized :class:`BestBidAsk` event.
@@ -490,6 +496,7 @@ class BidOfferAdapter:
             ask_flag=int(msg.ask_flag),
             recv_ts=recv_ts,
             recv_mono_ns=recv_mono_ns,
+            connection_epoch=connection_epoch,
         )
 
     @staticmethod
@@ -497,6 +504,7 @@ class BidOfferAdapter:
         msg: BidOfferV3,
         recv_ts: int,
         recv_mono_ns: int,
+        connection_epoch: int,
     ) -> FullBidOffer:
         """Extract full 10-level depth from BidOfferV3 into FullBidOffer.
 
@@ -513,6 +521,8 @@ class BidOfferAdapter:
             recv_ts: Wall-clock timestamp from ``time.time_ns()``.
             recv_mono_ns: Monotonic timestamp from
                 ``time.perf_counter_ns()``.
+            connection_epoch: Reconnect generation counter from
+                :attr:`SettradeMQTTClient.reconnect_epoch`.
 
         Returns:
             Normalized :class:`FullBidOffer` event.
@@ -571,4 +581,5 @@ class BidOfferAdapter:
             ask_flag=int(msg.ask_flag),
             recv_ts=recv_ts,
             recv_mono_ns=recv_mono_ns,
+            connection_epoch=connection_epoch,
         )
