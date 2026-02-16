@@ -402,45 +402,45 @@ def is_stale(self, symbol: str, now_ns: int | None = None) -> bool:
 
 ### Functional Requirements
 
-- [ ] All events include `connection_epoch` field (default 0)
-- [ ] `FeedHealthMonitor` detects stale feeds per symbol using **monotonic timestamps only**
-- [ ] `is_feed_dead()` detects global feed silence, returns `False` before first event (startup-aware)
-- [ ] `has_ever_received()` distinguishes "unknown" from "healthy"
-- [ ] Per-symbol gap override via `per_symbol_max_gap` config
-- [ ] `is_stale()` returns `False` for never-seen symbols, `has_seen()` for distinction
-- [ ] `connection_epoch` increments on MQTT reconnect **after** subscription replay (not initial connect)
-- [ ] `dispatcher.health()` returns EMA drop-rate, queue utilization, AND lifetime counters
-- [ ] EMA alpha and drop warning threshold are configurable via `DispatcherConfig`
-- [ ] `is_auction()` uses `BidAskFlag` enum (no magic numbers)
-- [ ] Optional `now_ns` parameter for `perf_counter_ns()` reuse in hot loops
-- [ ] Strategy guard rail example demonstrates feed dead, drop rate, and reconnect handling
-- [ ] README includes ASCII diagram showing drop-prone points in data flow
+- [x] All events include `connection_epoch` field (default 0)
+- [x] `FeedHealthMonitor` detects stale feeds per symbol using **monotonic timestamps only**
+- [x] `is_feed_dead()` detects global feed silence, returns `False` before first event (startup-aware)
+- [x] `has_ever_received()` distinguishes "unknown" from "healthy"
+- [x] Per-symbol gap override via `per_symbol_max_gap` config
+- [x] `is_stale()` returns `False` for never-seen symbols, `has_seen()` for distinction
+- [x] `connection_epoch` increments on MQTT reconnect **after** subscription replay (not initial connect)
+- [x] `dispatcher.health()` returns EMA drop-rate, queue utilization, AND lifetime counters
+- [x] EMA alpha and drop warning threshold are configurable via `DispatcherConfig`
+- [x] `is_auction()` uses `BidAskFlag` enum (no magic numbers)
+- [x] Optional `now_ns` parameter for `perf_counter_ns()` reuse in hot loops
+- [x] Strategy guard rail example demonstrates feed dead, drop rate, and reconnect handling
+- [x] README includes ASCII diagram showing drop-prone points in data flow
 
 ### Architectural Requirements
 
-- [ ] No locks added to hot path (minimal latency impact)
-- [ ] EMA update is O(1) with no memory growth (single float per dispatcher)
-- [ ] Monotonic timestamps prevent NTP-related false positives
-- [ ] Per-symbol tracking with configurable gap thresholds
-- [ ] Explicit signal exposure (no hidden enforcement logic)
-- [ ] FeedHealthMonitor thread safety explicitly documented (single consumer thread only)
+- [x] No locks added to hot path (minimal latency impact)
+- [x] EMA update is O(1) with no memory growth (single float per dispatcher)
+- [x] Monotonic timestamps prevent NTP-related false positives
+- [x] Per-symbol tracking with configurable gap thresholds
+- [x] Explicit signal exposure (no hidden enforcement logic)
+- [x] FeedHealthMonitor thread safety explicitly documented (single consumer thread only)
 
 ### Testing Requirements
 
-- [ ] Unit tests for `FeedHealthMonitor` with monotonic time manipulation
-- [ ] Unit tests for `is_feed_dead()` startup state (returns False before first event)
-- [ ] Unit tests for `has_ever_received()` and `has_seen()`
-- [ ] Unit tests for per-symbol gap override
-- [ ] Unit tests for EMA drop-rate calculation with known sequences
-- [ ] Unit tests for configurable EMA alpha and drop warning threshold
-- [ ] Unit tests for `health()` including lifetime counters
-- [ ] Unit tests for `is_auction()` with different flag combinations (including mixed)
-- [ ] Unit tests for `connection_epoch` field in event models
-- [ ] Test that wall clock jump does NOT trigger false stale detection
-- [ ] All existing tests continue to pass (no regressions)
+- [x] Unit tests for `FeedHealthMonitor` with monotonic time manipulation
+- [x] Unit tests for `is_feed_dead()` startup state (returns False before first event)
+- [x] Unit tests for `has_ever_received()` and `has_seen()`
+- [x] Unit tests for per-symbol gap override
+- [x] Unit tests for EMA drop-rate calculation with known sequences
+- [x] Unit tests for configurable EMA alpha and drop warning threshold
+- [x] Unit tests for `health()` including lifetime counters
+- [x] Unit tests for `is_auction()` with different flag combinations (including mixed)
+- [x] Unit tests for `connection_epoch` field in event models
+- [x] Test that wall clock jump does NOT trigger false stale detection
+- [x] All existing tests continue to pass (no regressions)
 
 ---
 
-**Document Version:** 1.1
+**Document Version:** 1.2
 **Author:** AI Agent
-**Status:** In Progress
+**Status:** Complete
