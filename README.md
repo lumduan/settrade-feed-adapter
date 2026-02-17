@@ -1,606 +1,91 @@
 # settrade-feed-adapter
 
-A **market data ingestion layer** for Settrade Open API that provides direct control over the MQTT → Protobuf → Event pipeline.
+A market data ingestion layer tailored for Settrade Open API — designed for reliable real-time feed processing, normalization, and delivery.
 
-Designed for developers who need **explicit control**, **typed event models**, and **deterministic backpressure handling** instead of the convenient but opaque official SDK.
+## What It Does
 
-> This adapter is an infrastructure foundation, not a trading framework. It ends at normalized event emission — what you do with those events is your responsibility.
+settrade-feed-adapter provides:
 
-Official Settrade API Docs: https://developer.settrade.com/open-api/api-reference/reference/sdkv2/python/market-mqtt-realtime-data/1_gettingStart
+- **Real-time feed ingestion** from Settrade Open API via MQTT transport
+- **Event normalization** into strongly-typed models (`BestBidAsk`, `FullBidOffer`, etc.)
+- **Back-pressure-aware dispatcher** with bounded queues and drop policies
+- **Feed livelihood tracking** per symbol and globally
+- **Observability APIs** (metrics, logging, health)
+- **Test-backed guarantees** for concurrency, ordering, and error isolation
 
----
+## Quick Links
 
-## Design Philosophy
+All detailed documentation is maintained under the `docs/` directory:
 
-This project is built on these architectural principles:
+### For Newcomers
 
-- **Minimal hot-path logic** — Parse and normalize only, no business logic
-- **Explicit backpressure** — Bounded queue with drop-oldest strategy (no hidden buffering)
-- **No hidden thread pools** — Single MQTT IO thread, explicit dispatcher, clear ownership
-- **Strong typing** — Pydantic models instead of dynamic dictionaries
-- **Predictable event flow** — Deterministic pipeline from bytes to typed events
-- **Nanosecond timestamps** — Dual timestamps (`recv_ts` wall clock + `recv_mono_ns` monotonic) for latency measurement
+Start with:
 
----
+- [What Is This?](docs/00_getting_started/what_is_this.md) — Overview and design goals
+- [Quickstart Guide](docs/00_getting_started/quickstart.md) — Get running quickly
+- [Mental Model](docs/00_getting_started/mental_model.md) — Conceptual explanation
 
-## Scope
+### Architecture & Design
 
-This project focuses **solely on market data ingestion**.
+- [System Architecture](docs/01_system_overview/architecture.md)
+- [Data Flow](docs/01_system_overview/data_flow.md)
+- [Threading and Concurrency](docs/01_system_overview/threading_and_concurrency.md)
 
-### What This Adapter Provides
+### Transport & Connectivity
 
-- MQTT transport handling (WebSocket Secure + TLS + auto-reconnect)
-- Protobuf decoding (BidOfferV3 → typed events)
-- Event normalization (`BestBidAsk`, `FullBidOffer` models)
-- Bounded dispatch queue with explicit drop strategy
-- Direct protobuf field access (no JSON/dict layer)
+- [MQTT Authentication and Token](docs/02_transport_mqtt/authentication_and_token.md)
+- [Reconnect Strategy](docs/02_transport_mqtt/reconnect_strategy.md)
+- [Subscription Model](docs/02_transport_mqtt/subscription_model.md)
 
-### What This Adapter Does NOT Provide
+### Adapter & Normalization
 
-- **Order execution** — Use the official SDK's order API
-- **Strategy logic** — Implement your own
-- **Persistence / data storage** — Up to you (InfluxDB, Parquet, etc.)
-- **Replay systems** — Build on top if needed
-- **Backtesting** — Out of scope
-- **Risk management** — Your responsibility
-- **Position tracking** — Not included
+- [Parsing Pipeline](docs/03_adapter_and_normalization/parsing_pipeline.md)
+- [Normalization Contract](docs/03_adapter_and_normalization/normalization_contract.md)
 
-This is an **ingestion layer**, not a trading framework.
+### Event Models
 
----
+- [Event Contract](docs/04_event_models/event_contract.md)
+- [Best Bid-Ask](docs/04_event_models/best_bid_ask.md)
+- [Full Bid-Offer](docs/04_event_models/full_bid_offer.md)
 
-## Key Architectural Advantages
+### Dispatcher & Backpressure
 
-Compared to the official SDK's dictionary-based approach:
+- [Queue Model](docs/05_dispatcher_and_backpressure/queue_model.md)
+- [Backpressure and Overflow Policy](docs/05_dispatcher_and_backpressure/overflow_policy.md)
 
-| Aspect | Official SDK | This Adapter |
-| --- | --- | --- |
-| **Data Model** | Dynamic `dict` | Typed Pydantic models |
-| **Event Dispatch** | Hidden threading | Explicit bounded queue |
-| **Pipeline Visibility** | Opaque callbacks | You own the flow |
-| **Abstraction Layer** | JSON-style `.to_dict()` | Direct protobuf field access |
-| **Backpressure** | Implicit (thread pool) | Explicit (drop-oldest) |
-| **Replay Support** | Not designed for it | Easier to integrate |
-| **Integration** | High-level convenience | Low-level control |
-| **Event Continuity Guarantee** | Not specified | Snapshot-based only (no sequence IDs) |
+### Feed Liveness
 
-### Why Choose This Adapter?
+- [Global Liveness](docs/06_feed_liveness/global_liveness.md)
+- [Per Symbol Liveness](docs/06_feed_liveness/per_symbol_liveness.md)
 
-The official SDK is **production-ready and convenient** for most use cases.
+### Observability
 
-However, it returns dynamic JSON-style dictionaries and hides the ingestion pipeline behind callback threads.
+- [Metrics Reference](docs/07_observability/metrics_reference.md)
+- [Logging Policy](docs/07_observability/logging_policy.md)
 
-**Use this adapter if you need:**
+### Testing & Production
 
-- Explicit control over message parsing and event flow
-- Strongly typed events for safer integration
-- Custom backpressure handling for high-frequency data
-- Integration into low-latency pipelines with measurable overhead
-- Foundation for building custom trading infrastructure
-- Easier testing and replay mechanisms
+- [Concurrency Guarantees](docs/08_testing_and_guarantees/concurrency_guarantees.md)
+- [Failure Scenarios](docs/08_testing_and_guarantees/failure_scenarios.md)
+- [Production Checklist](docs/09_production_guide/deployment_checklist.md)
 
-**Stick with the SDK if you need:**
+### Glossary
 
-- Convenience and simplicity
-- Official support and updates
-- Order execution API integration
-- You don't need pipeline-level control
+- [Glossary](docs/glossary.md)
 
----
+## Examples
 
-## Intended Audience
+See the `examples/` directory for ready-to-run usage examples:
 
-This project is designed for:
+- `example_bidoffer.py`
+- `example_feed_health.py`
 
-- **Retail algorithmic traders** building custom trading infrastructure
-- **Developers** who require pipeline-level control over market data
-- **System integrators** who need explicit threading and backpressure management
-- **Researchers** who need typed events and replay mechanisms
-
-**This adapter is NOT intended for:**
-
-- **Ultra-low-latency HFT** — Co-located exchange trading requires direct exchange feeds
-- **Systems requiring exchange-level sequence guarantees** — This is a snapshot feed without sequence IDs
-- **Production systems without feed health monitoring** — See Feed Health Monitoring section below
-- **Users who need exact decimal precision** — This adapter uses float representation for speed
-
----
-
-## Performance
-
-### Realistic Performance Expectations
-
-This adapter provides **modest latency improvements** in parse + normalize operations (approximately **1.1–1.3x faster** than the SDK path in practice), depending on workload and environment.
-
-**The primary value is architectural control and deterministic event flow, not raw microsecond gains.**
-
-### Implementation Differences
-
-The adapter takes a different approach than the SDK:
-
-| Implementation Choice | Official SDK | This Adapter | Tradeoff |
-| --- | --- | --- | --- |
-| **Callback execution** | `threading.Thread` per message | Inline in MQTT thread | Less overhead, but blocks IO thread |
-| **Message parsing** | `.parse(msg).to_dict(casing=SNAKE)` | `.parse(msg)` + direct field access | Fewer allocations, but less convenient |
-| **Price representation** | `Decimal(units) + Decimal(nanos) / 1e9` | `units + nanos * 1e-9` (float) | Faster, but loses exact decimal precision |
-| **Synchronization** | `threading.Lock` on callback pool | `deque.append()` (GIL-atomic) | Simpler, assumes CPython GIL |
-
-### Benchmark Methodology
-
-The benchmark suite measures **parse + normalize latency only** — the cost of converting a raw protobuf payload into a normalized event object. This isolates the performance delta we actually control, excluding network latency which is identical for both paths.
-
-**SDK path measured:**
-
-```python
-BidOfferV3().parse(payload).to_dict(casing=betterproto.Casing.SNAKE, include_default_values=True)
-```
-
-**Adapter path measured:**
-
-```python
-msg = BidOfferV3().parse(payload)
-BestBidAsk.model_construct(symbol=..., bid=msg.bid_price1.units + msg.bid_price1.nanos * 1e-9, ...)
-```
-
-Both paths use:
-
-- Identical synthetic payloads (fully-populated BidOfferV3 with 10 bid/ask levels)
-- Per-message variation to defeat branch predictor / CPU cache effects
-- 1,000 warmup messages discarded before measurement
-- 3 independent runs with mean +/- stddev for confidence
-- GC enabled (realistic conditions)
-- Separate processes for isolation
-
-### Running Benchmarks
+## Running Tests
 
 ```bash
-# Run full comparison (SDK vs Adapter)
-python -m scripts.benchmark_compare
-
-# Run SDK baseline only
-python -m scripts.benchmark_sdk --num-messages 50000 --num-runs 3
-
-# Run adapter only
-python -m scripts.benchmark_adapter --num-messages 50000 --num-runs 3
-
-# Custom comparison with different target
-python -m scripts.benchmark_compare --num-messages 100000 --target-p99-ratio 3.0
+uv run pytest tests -v
 ```
-
-### Performance Notes
-
-**In practice**, parse + normalize latency improvements are **modest (~1.1–1.3x)** and highly environment-dependent.
-
-Absolute latency numbers vary by:
-- CPU model and clock speed
-- OS scheduler behavior and system load
-- Python version and interpreter optimizations
-- Memory pressure and garbage collection timing
-
-**The comparison ratio (adapter vs SDK) is more stable than absolute numbers.**
-
-For authoritative results, benchmark on your target production environment with your actual workload.
-
-### Important Benchmark Limitations
-
-**Read this carefully before interpreting results:**
-
-- **Synthetic payloads only** — Benchmarks use `SerializeToString()` payloads, not live broker traffic. Real-world payloads may differ in size and field population.
-  
-- **Isolated measurement** — Benchmarks measure parse latency in isolation. Production systems have GIL contention from the MQTT IO thread and strategy thread running concurrently. **Real-world speedups will be lower.**
-
-- **CPython-specific** — All results assume CPython's GIL guarantees for `deque.append()` / `deque.popleft()` atomicity. Results are not valid for PyPy, GraalPy, or nogil Python.
-
-- **Float vs Decimal precision** — The adapter converts `Money(units, nanos)` to `float` via `units + nanos * 1e-9`. The SDK uses `Decimal` for exact arithmetic. **If you need exact decimal representation (e.g., regulatory reporting, accounting), the SDK path may be more appropriate.** The adapter path is designed for latency-sensitive trading where float precision (~15 significant digits) is typically sufficient.
-
-- **Environment-dependent** — Absolute latency numbers vary by CPU, OS scheduler, and system load. Benchmark on your target production environment for authoritative results.
-
-- **No network latency** — Benchmarks measure parse + normalize cost only. Network latency (broker to client) is identical for both paths and excluded from measurement.
-
-- **`process_time` resolution** — CPU measurement uses `time.process_time()` which has OS-dependent resolution (~1ms on some platforms).
-
----
-
-## Market Data Guarantees & Limitations
-
-### Data Model Characteristics
-
-This adapter consumes **snapshot-based market data** (e.g., `BidOfferV3`).
-
-**Important implications:**
-
-- ❌ **No exchange sequence numbers are provided** — Cannot detect gaps at the exchange level
-- ❌ **No incremental delta updates** — Each message is a full snapshot
-- ❌ **No replay mechanism** — Missed messages during disconnect cannot be recovered
-- ❌ **No event-level continuity guarantee** — Silent gaps are possible
-
-**Each message represents the current top-of-book snapshot at publish time.**
-
-### What Happens During Disconnect?
-
-If the MQTT connection drops:
-
-- ✅ **Order book state remains correct** — Reconnect receives the latest snapshot
-- ❌ **Intermediate snapshots are lost** — Data between disconnect and reconnect is not recoverable
-- ❌ **Microstructure transitions are not observable** — Price movements during the gap are invisible
-
-This is a **snapshot stream**, not an incremental sequenced feed.
-
-### Silent Gap Risk
-
-Because no exchange sequence number is provided:
-
-- ❌ **Event-level gap detection is not possible** — Cannot tell if message N+1 immediately follows message N
-- ❌ **The adapter cannot detect lost messages at the exchange level** — MQTT QoS 0 may drop messages under load
-- ⚠️ **Feed health must be monitored via time-based liveness detection** — See next section
-
-**Users building trading systems must account for this limitation.**
-
-### Transparency = Credibility
-
-This adapter does **not** provide:
-
-- Exchange sequence numbers
-- Gap detection
-- Message replay
-- Continuity guarantees
-
-It provides **what it is**: a low-level **snapshot ingestion layer** with explicit control.
-
-If you need exchange-level sequencing, consider direct exchange connectivity or a different data provider.
-
----
-
-## Feed Health Monitoring
-
-### Why You Need This
-
-Because this is a **snapshot feed without sequence IDs**, production trading systems **must** implement:
-
-- **Feed liveness detection** — Detect stale feed (max inter-event gap)
-- **Reconnect detection** — Detect when the adapter reconnects (events may have been missed)
-- **Drop-rate monitoring** — Detect when the dispatcher is dropping events
-- **Strategy guard rails** — Block trading decisions when feed becomes stale
-
-**This adapter exposes health signals but does not enforce trading decisions** — your strategy decides what to do.
-
-### Where Drops Can Happen
-
-```text
-MQTT Broker (QoS 0)
-    │
-    │  ← ❶ Network / QoS 0 drop (undetectable)
-    │
-    ▼
-SettradeMQTTClient
-    │ on_message(payload)
-    │  ← ❷ Parse error → event lost (counted in adapter stats)
-    ▼
-BidOfferAdapter
-    │ on_event(event)
-    │  ← ❸ Dispatcher full → oldest evicted (counted in health())
-    ▼
-Dispatcher[BestBidAsk]     ← health().drop_rate_ema
-    │ poll(max_events=N)
-    │  ← ❹ Strategy too slow → events age in queue
-    ▼
-Strategy Loop              ← FeedHealthMonitor.is_stale()
-```
-
-### Built-in Health Components
-
-The adapter provides two health components:
-
-**`FeedHealthMonitor`** — Two-tier feed liveness detection:
-
-- **Global:** `is_feed_dead()` — entire MQTT connection appears dead
-- **Per-symbol:** `is_stale(symbol)` — specific symbol data is stale
-- Uses **monotonic time only** (`perf_counter_ns`) — NTP-immune
-- Startup-aware: returns `False` before first event (unknown ≠ dead)
-- Per-symbol gap override for illiquid symbols
-
-**`Dispatcher.health()`** — EMA-smoothed drop rate:
-
-- `drop_rate_ema` — smoothed drop rate (0.0 = no drops)
-- `queue_utilization` — current queue fill ratio
-- Lifetime counters: `total_dropped`, `total_pushed`
-
-### Production Guard Rail Pattern
-
-```python
-from core.dispatcher import Dispatcher, DispatcherConfig, DispatcherHealth
-from core.events import BestBidAsk
-from core.feed_health import FeedHealthConfig, FeedHealthMonitor
-
-monitor = FeedHealthMonitor(
-    config=FeedHealthConfig(
-        max_gap_seconds=5.0,
-        per_symbol_max_gap={"RARE": 60.0},  # illiquid override
-    ),
-)
-
-last_epoch: int | None = None
-
-while True:
-    events = dispatcher.poll(max_events=100)
-    now_ns = time.perf_counter_ns()  # capture once per loop
-
-    for event in events:
-        monitor.on_event(event.symbol, now_ns=now_ns)
-
-        # Guard 1: Reconnect detection
-        if last_epoch is None:
-            last_epoch = event.connection_epoch
-        elif event.connection_epoch != last_epoch:
-            last_epoch = event.connection_epoch
-            # Reinitialize strategy state — data may have been missed
-
-        # Guard 2: Auction period awareness
-        if event.is_auction():
-            pass  # Skip limit orders during ATO/ATC
-
-    # Guard 3: Feed-dead detection
-    if monitor.has_ever_received() and monitor.is_feed_dead(now_ns=now_ns):
-        pass  # Pause trading — entire feed is silent
-
-    # Guard 4: Drop-rate detection
-    health: DispatcherHealth = dispatcher.health()
-    if health.drop_rate_ema > 0.01:
-        pass  # Reduce position size — queue is overflowing
-```
-
-See `examples/example_feed_health.py` for a complete working example.
-
-### Production Considerations
-
-- **Per-symbol thresholds** — PTT ticks every ~50ms, illiquid stocks may go 30+ minutes
-- **Market hours** — Different gap thresholds during market open vs pre-open
-- **Reconnect events** — `connection_epoch` changes indicate potential data gaps
-- **Circuit breakers** — Use `is_feed_dead()` to halt trading when feed is silent
-- **Latency monitoring** — Track `recv_mono_ns` to detect feed lag
-
----
-
-## Architecture
-
-```text
-settrade-feed-adapter/
-├── core/
-│   ├── events.py                # Pydantic event models: BestBidAsk, FullBidOffer
-│   ├── dispatcher.py            # Bounded deque dispatcher with EMA drop-rate
-│   ├── feed_health.py           # Two-tier feed health monitor (monotonic)
-│   └── __init__.py
-├── infra/
-│   ├── settrade_mqtt.py         # MQTT transport (WSS + TLS + reconnect_epoch)
-│   ├── settrade_adapter.py      # BidOffer adapter (protobuf → event)
-│   └── __init__.py
-├── scripts/
-│   ├── benchmark_utils.py       # Shared benchmark infrastructure
-│   ├── benchmark_sdk.py         # SDK baseline benchmark
-│   ├── benchmark_adapter.py     # Adapter benchmark
-│   └── benchmark_compare.py     # Comparison report generator
-├── examples/
-│   ├── example_bidoffer.py      # Real-world usage with latency measurement
-│   └── example_feed_health.py   # Feed health monitoring with guard rails
-├── tests/
-│   ├── test_events.py
-│   ├── test_dispatcher.py
-│   ├── test_feed_health.py
-│   ├── test_settrade_adapter.py
-│   ├── test_settrade_mqtt.py
-│   └── test_benchmark_utils.py
-└── docs/
-    └── plan/
-        └── low-latency-mqtt-feed-adapter/
-            └── PLAN.md
-```
-
-### Data Flow
-
-```text
-MQTT Broker (WSS/443)
-    │                        (snapshot stream, no replay, no sequence IDs)
-    ▼
-SettradeMQTTClient           ← MQTT IO thread (paho loop_start)
-    │ on_message(payload)       reconnect_epoch incremented on reconnect
-    ▼
-BidOfferAdapter              ← Parse protobuf, attach connection_epoch
-    │ on_event(event)
-    ▼
-Dispatcher[BestBidAsk]       ← Bounded deque + EMA drop-rate tracking
-    │ poll(max_events=100)      health() → drop_rate_ema, queue_utilization
-    ▼
-Strategy Loop                ← Main thread consumes events
-    │                           FeedHealthMonitor.on_event(symbol)
-    ├── is_feed_dead()          Global feed silence detection
-    ├── is_stale(symbol)        Per-symbol liveness detection
-    └── connection_epoch        Reconnect-aware state management
-```
-
----
-
-## Requirements
-
-- Python 3.10+
-- `paho-mqtt` for MQTT transport
-- `pydantic` >= 2.0 for event models
-- `settrade-v2` >= 2.2.1 for protobuf schemas and authentication
-- A valid Settrade Open API **App ID**, **App Secret**, **App Code**, and **Broker ID**
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/lumduan/settrade-feed-adapter.git
-cd settrade-feed-adapter
-pip install -e .
-```
-
----
-
-## Quick Start
-
-> ⚠️ **Production Use Notice**
->
-> This adapter provides **snapshot-based market data ingestion**.
-> It does **not** guarantee event continuity or replay.
->
-> If you build automated trading systems on top of it, you **must** implement:
-> - Feed health monitoring (see Feed Health Monitoring section)
-> - Reconnect detection
-> - Circuit breakers when feed becomes stale
->
-> See the **Market Data Guarantees & Limitations** section for details.
-
-1. Copy `.env.sample` to `.env` and fill in credentials:
-
-```bash
-cp .env.sample .env
-# Edit .env with your SETTRADE_APP_ID, SETTRADE_APP_SECRET, SETTRADE_APP_CODE, SETTRADE_BROKER_ID
-```
-
-2. Run the example:
-
-```bash
-python -m examples.example_bidoffer --symbol AOT
-```
-
-### Usage Example
-
-```python
-import os
-from core.dispatcher import Dispatcher, DispatcherConfig
-from core.events import BestBidAsk
-from infra.settrade_adapter import BidOfferAdapter, BidOfferAdapterConfig
-from infra.settrade_mqtt import MQTTClientConfig, SettradeMQTTClient
-
-# Setup MQTT client
-mqtt_config = MQTTClientConfig(
-    app_id=os.environ["SETTRADE_APP_ID"],
-    app_secret=os.environ["SETTRADE_APP_SECRET"],
-    app_code=os.environ["SETTRADE_APP_CODE"],
-    broker_id=os.environ["SETTRADE_BROKER_ID"],
-)
-mqtt_client = SettradeMQTTClient(config=mqtt_config)
-
-# Setup dispatcher and adapter
-dispatcher: Dispatcher[BestBidAsk] = Dispatcher(
-    config=DispatcherConfig(maxlen=100_000),
-)
-adapter = BidOfferAdapter(
-    config=BidOfferAdapterConfig(),
-    mqtt_client=mqtt_client,
-    on_event=dispatcher.push,
-)
-
-# Connect and subscribe
-mqtt_client.connect()
-adapter.subscribe(symbol="AOT")
-
-# Strategy loop
-try:
-    while True:
-        events = dispatcher.poll(max_events=100)
-        for event in events:
-            print(f"{event.symbol} bid={event.bid:.2f} ask={event.ask:.2f}")
-        if not events:
-            import time
-            time.sleep(0.05)
-except KeyboardInterrupt:
-    mqtt_client.shutdown()
-```
-
----
-
-## Event Models
-
-### BestBidAsk
-
-Best bid/ask (level 1) with dual timestamps and feed integrity fields:
-
-```python
-class BestBidAsk(BaseModel):
-    symbol: str
-    bid: float                  # Best bid price (bid_price1)
-    ask: float                  # Best ask price (ask_price1)
-    bid_vol: int                # Best bid volume (bid_volume1)
-    ask_vol: int                # Best ask volume (ask_volume1)
-    bid_flag: BidAskFlag        # UNDEFINED=0, NORMAL=1, ATO=2, ATC=3
-    ask_flag: BidAskFlag        # UNDEFINED=0, NORMAL=1, ATO=2, ATC=3
-    recv_ts: int                # time.time_ns() at receive (wall clock)
-    recv_mono_ns: int           # time.perf_counter_ns() (monotonic)
-    connection_epoch: int = 0   # Reconnect generation (0 = initial)
-
-    def is_auction(self) -> bool: ...  # True during ATO/ATC
-```
-
-### FullBidOffer
-
-Full 10-level depth book:
-
-```python
-class FullBidOffer(BaseModel):
-    symbol: str
-    bid_prices: tuple[float, ...]    # Top 10 bid prices
-    ask_prices: tuple[float, ...]    # Top 10 ask prices
-    bid_volumes: tuple[int, ...]     # Top 10 bid volumes
-    ask_volumes: tuple[int, ...]     # Top 10 ask volumes
-    bid_flag: BidAskFlag
-    ask_flag: BidAskFlag
-    recv_ts: int
-    recv_mono_ns: int
-    connection_epoch: int = 0
-
-    def is_auction(self) -> bool: ...
-```
-
----
-
-## Testing
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run with coverage
-python -m pytest tests/ -v --cov=core --cov=infra --cov=scripts
-```
-
----
-
-## Development
-
-### Project Structure
-
-| Directory | Purpose |
-| --- | --- |
-| `core/` | Domain layer: event models, dispatcher, feed health |
-| `infra/` | Infrastructure: MQTT transport, protobuf adapter |
-| `scripts/` | Benchmark scripts and utilities |
-| `examples/` | Usage examples with latency and feed health |
-| `tests/` | Unit tests |
-| `docs/` | Implementation plans |
-
----
-
-## Notes
-
-- Ensure your API credentials can fetch real-time feeds (some broker sandbox accounts may have limitations)
-- Market data structure may evolve — always refer to official Settrade docs
-- This adapter relies on CPython's GIL for thread safety — not compatible with nogil Python or alternative interpreters without modification
-
----
 
 ## License
 
-MIT License
-
----
-
-## Contributing
-
-1. Fork it
-2. Build in a feature branch
-3. Write tests
-4. Submit a PR
+This project is licensed under the MIT License.
