@@ -1,212 +1,219 @@
 # Parsing Pipeline
 
-Protobuf decoding and event model construction.
+Protobuf decoding, normalization, and event construction inside the
+`BidOfferAdapter._on_message` hot path.
 
 ---
 
-## Pipeline Flow
+## End-to-End Flow
 
+```text
+protobuf bytes (from MQTT)
+  |
+  v
+BidOfferV3().parse(payload)          # deserialize protobuf
+  |
+  v
+validate / normalize fields          # uppercase symbol, Money -> float, int(flag)
+  |
+  v
+BestBidAsk.model_construct(...)      # or FullBidOffer.model_construct(...)
+  |                                  # (no Pydantic validation -- hot path)
+  v
+on_event(event)                      # EventCallback invoked
 ```
-Raw Binary Payload (bytes)
-  ↓
-betterproto.parse() → BidOfferV3 protobuf message
-  ↓
-Extract fields (direct access, no .to_dict())
-  ↓
-Convert Money to float (units + nanos * 1e-9)
-  ↓
-Normalize (uppercase symbol, validate ranges)
-  ↓
-Pydantic model construction (model_construct for speed)
-  ↓
-BestBidAsk or FullBidOffer event
-  ↓
-dispatcher.push(event)
-```
+
+Every message that reaches `_on_message` follows this exact sequence.
+Timestamps (`recv_ts`, `recv_mono_ns`) and the current `connection_epoch` are
+captured **before** protobuf parsing begins, so they reflect true arrival time.
 
 ---
 
-## Hot Path Optimization
+## Two Output Modes
 
-### Direct Field Access
+The adapter produces one of two event types, controlled by
+`BidOfferAdapterConfig.full_depth`:
 
-**SDK approach** (slow):
+| Config | Event type | Content |
+| --- | --- | --- |
+| `full_depth=False` (default) | `BestBidAsk` | Top-of-book: single bid/ask price, volume, flag |
+| `full_depth=True` | `FullBidOffer` | 10-level book: tuples of 10 prices and 10 volumes per side |
+
+The adapter constructor accepts `on_event: EventCallback` where
+`EventCallback = Callable[[BidOfferEvent], None]` and
+`BidOfferEvent = Union[BestBidAsk, FullBidOffer]`.
+
+---
+
+## Hot-Path Optimizations
+
+### 1. `model_construct` Instead of Normal Construction
+
+Normal Pydantic construction runs validators on every field:
+
 ```python
+# Slow -- validators fire for every field
+event = BestBidAsk(
+    symbol=symbol,
+    bid=bid,
+    ask=ask,
+    bid_vol=bid_vol,
+    ask_vol=ask_vol,
+    bid_flag=bid_flag,
+    ask_flag=ask_flag,
+    recv_ts=recv_ts,
+    recv_mono_ns=recv_mono_ns,
+    connection_epoch=connection_epoch,
+)
+```
+
+The hot path uses `model_construct`, which skips all validation:
+
+```python
+# Fast -- no validation overhead
+event = BestBidAsk.model_construct(
+    symbol=symbol,
+    bid=bid,
+    ask=ask,
+    bid_vol=bid_vol,
+    ask_vol=ask_vol,
+    bid_flag=bid_flag,
+    ask_flag=ask_flag,
+    recv_ts=recv_ts,
+    recv_mono_ns=recv_mono_ns,
+    connection_epoch=connection_epoch,
+)
+```
+
+This is safe because the protobuf message is the trusted data source and the
+adapter performs its own inline normalization before constructing the event.
+
+### 2. Inline Money Conversion (No Function Call)
+
+A utility function `money_to_float(money)` exists for tests and external code,
+but the hot path does **not** call it. Instead it inlines the arithmetic:
+
+```python
+bid = msg.bid_price1.units + msg.bid_price1.nanos * 1e-9
+```
+
+This avoids function-call overhead on every price field.
+
+### 3. Direct Protobuf Field Access (No `.to_dict()`)
+
+The Settrade SDK example converts the protobuf to a dictionary first:
+
+```python
+# SDK approach -- allocates a dict
 msg_dict = BidOfferV3().parse(payload).to_dict(casing=betterproto.Casing.SNAKE)
-bid = Decimal(msg_dict["bid_price1"]["units"]) + Decimal(msg_dict["bid_price1"]["nanos"]) / Decimal("1e9")
+bid = msg_dict["bid_price1"]["units"] + ...
 ```
 
-**Our approach** (fast):
+The adapter accesses fields directly on the protobuf object:
+
 ```python
+# Our approach -- no dict allocation
 msg = BidOfferV3().parse(payload)
 bid = msg.bid_price1.units + msg.bid_price1.nanos * 1e-9
 ```
 
-**Benefit**: No dictionary allocation, direct protobuf field access.
-
 ---
 
-### Skip Pydantic Validation
+## BestBidAsk Parsing (Default Mode)
 
-**Normal construction** (slower):
 ```python
-event = BestBidAsk(
-    symbol=symbol,
-    bid=bid,
-    # ... validation runs ...
-)
-```
+msg = BidOfferV3().parse(payload)
 
-**Hot path construction** (faster):
-```python
 event = BestBidAsk.model_construct(
-    symbol=symbol,
-    bid=bid,
-    # ... validation skipped ...
+    symbol=msg.symbol.upper(),
+    bid=msg.bid_price1.units + msg.bid_price1.nanos * 1e-9,
+    ask=msg.ask_price1.units + msg.ask_price1.nanos * 1e-9,
+    bid_vol=msg.bid_volume1,
+    ask_vol=msg.ask_volume1,
+    bid_flag=int(msg.bid_flag),
+    ask_flag=int(msg.ask_flag),
+    recv_ts=recv_ts,
+    recv_mono_ns=recv_mono_ns,
+    connection_epoch=self._mqtt_client.reconnect_epoch,
 )
 ```
 
-**Warning**: Only use `model_construct()` when data is pre-validated (hot path from trusted source).
+This allocates only the protobuf parse result and the single frozen Pydantic
+model -- no intermediate containers.
 
 ---
 
-## Money Conversion
+## FullBidOffer Parsing (full_depth=True)
 
-Settrade uses protobuf `Money` type:
-
-```protobuf
-message Money {
-  int64 units = 1;
-  int32 nanos = 2;
-}
-```
-
-**Conversion**:
-```python
-def money_to_float(money) -> float:
-    return money.units + money.nanos * 1e-9
-```
-
-**Example**:
-- `Money(units=25, nanos=500_000_000)` → `25.5`
-- `Money(units=100, nanos=250_000_000)` → `100.25`
-
----
-
-## Implementation Example
+When `full_depth=True`, the adapter builds tuples of 10 price levels per side.
+All 10 levels are **explicitly unrolled** -- there is no loop, no `getattr`,
+and no dynamic field-name construction:
 
 ```python
-def _on_raw_message(
-    topic: str,
-    payload: bytes,
-    recv_ts: int,
-    recv_mono_ns: int,
-) -> None:
-    try:
-        # 1. Parse protobuf
-        msg: BidOfferV3 = BidOfferV3().parse(payload)
-        
-        # 2. Extract symbol
-        symbol: str = msg.symbol.upper()
-        
-        # 3. Convert Money to float
-        bid: float = msg.bid_price1.units + msg.bid_price1.nanos * 1e-9
-        ask: float = msg.ask_price1.units + msg.ask_price1.nanos * 1e-9
-        
-        # 4. Extract volumes and flags
-        bid_vol: int = msg.bid_volume1
-        ask_vol: int = msg.ask_volume1
-        bid_flag: int = int(msg.bid_flag)
-        ask_flag: int = int(msg.ask_flag)
-        
-        # 5. Construct event (skip validation)
-        event = BestBidAsk.model_construct(
-            symbol=symbol,
-            bid=bid,
-            ask=ask,
-            bid_vol=bid_vol,
-            ask_vol=ask_vol,
-            bid_flag=bid_flag,
-            ask_flag=ask_flag,
-            recv_ts=recv_ts,
-            recv_mono_ns=recv_mono_ns,
-            connection_epoch=self._mqtt_client.connection_epoch,
-        )
-        
-        # 6. Push to dispatcher
-        self._dispatcher.push(event)
-        self._stats.messages_parsed += 1
-        
-    except Exception as e:
-        self._stats.parse_errors += 1
-        logger.error(f"Parse error: {e}")
-```
-
----
-
-## Error Isolation
-
-Parse errors are **isolated**:
-- Exception caught
-- `parse_errors` counter incremented
-- Error logged
-- Continue processing (no crash)
-
-**Test**: `test_settrade_adapter.py::TestErrorHandling::test_parse_error_logged_and_counted`
-
----
-
-## Full Depth Parsing
-
-For Full 10-level book (`FullBidOffer`):
-
-```python
-# Parse all 10 bid levels
-bid_prices = tuple(
-    msg.bid_price1.units + msg.bid_price1.nanos * 1e-9,
-    msg.bid_price2.units + msg.bid_price2.nanos * 1e-9,
-    # ... up to bid_price10
+bid_prices = (
+    msg.bid_price1.units  + msg.bid_price1.nanos  * 1e-9,
+    msg.bid_price2.units  + msg.bid_price2.nanos  * 1e-9,
+    msg.bid_price3.units  + msg.bid_price3.nanos  * 1e-9,
+    msg.bid_price4.units  + msg.bid_price4.nanos  * 1e-9,
+    msg.bid_price5.units  + msg.bid_price5.nanos  * 1e-9,
+    msg.bid_price6.units  + msg.bid_price6.nanos  * 1e-9,
+    msg.bid_price7.units  + msg.bid_price7.nanos  * 1e-9,
+    msg.bid_price8.units  + msg.bid_price8.nanos  * 1e-9,
+    msg.bid_price9.units  + msg.bid_price9.nanos  * 1e-9,
+    msg.bid_price10.units + msg.bid_price10.nanos * 1e-9,
 )
 
-bid_volumes = tuple(
-    msg.bid_volume1,
-    msg.bid_volume2,
-    # ... up to bid_volume10
+bid_volumes = (
+    msg.bid_volume1,  msg.bid_volume2,  msg.bid_volume3,
+    msg.bid_volume4,  msg.bid_volume5,  msg.bid_volume6,
+    msg.bid_volume7,  msg.bid_volume8,  msg.bid_volume9,
+    msg.bid_volume10,
 )
+
+# Same pattern for ask_prices and ask_volumes
 ```
+
+### Performance Caveat
+
+`FullBidOffer` allocates approximately **46 objects per message**:
+
+- 4 tuples (bid_prices, ask_prices, bid_volumes, ask_volumes)
+- 40 float/int values inside those tuples
+- 1 FullBidOffer model instance
+- 1 protobuf parse result
+
+This is significantly heavier than `BestBidAsk`. Use `full_depth=True` only
+when downstream logic genuinely needs the full order book.
+
+---
+
+## Counter Semantics
+
+Every call to `_on_message` results in exactly **one** counter increment:
+
+| Outcome | Counter incremented |
+| --- | --- |
+| Protobuf parsed and callback succeeded | `_messages_parsed` |
+| Protobuf parse or normalization failed | `_parse_errors` |
+| Parse succeeded but `on_event` callback raised | `_callback_errors` |
+
+See [Error Isolation Model](./error_isolation_model.md) for details on the
+two-phase error handling within `_on_message`.
 
 ---
 
 ## Implementation Reference
 
-See [infra/settrade_adapter.py](../../infra/settrade_adapter.py):
-- `BidOfferAdapter._on_raw_message()` method
-- `_money_to_float()` helper function
-- Error handling logic
+- Adapter: `infra/settrade_adapter.py` -- `BidOfferAdapter._on_message`,
+  `_parse_best_bid_ask`, `_parse_full_bid_offer`
+- Events: `core/events.py` -- `BestBidAsk`, `FullBidOffer`, `BidAskFlag`
+- Utility: `money_to_float()` in `infra/settrade_adapter.py` (for tests; not
+  used in the hot path)
 
 ---
 
-## Test Coverage
+## Related Documents
 
-- `test_settrade_adapter.py::TestNormalization::test_money_conversion_accuracy`
-- `test_settrade_adapter.py::TestNormalization::test_symbol_uppercase_normalization`
-- `test_settrade_adapter.py::TestErrorHandling::test_parse_error_logged_and_counted`
-
----
-
-## Performance
-
-**Typical latency** (parse + normalize):
-- P50: ~10-15µs
-- P95: ~20-30µs
-- P99: ~40-60µs
-
-*Benchmarked on Apple M1, Python 3.12*
-
----
-
-## Next Steps
-
-- **[Normalization Contract](./normalization_contract.md)** — Data transformation rules
-- **[Money Precision Model](./money_precision_model.md)** — Float precision
-- **[Error Isolation Model](./error_isolation_model.md)** — Error handling
+- [Normalization Contract](./normalization_contract.md) -- what values are accepted and rejected
+- [Money Precision Model](./money_precision_model.md) -- float precision trade-offs
+- [Error Isolation Model](./error_isolation_model.md) -- two-phase error handling

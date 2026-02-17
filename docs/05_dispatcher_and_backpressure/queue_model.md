@@ -1,307 +1,161 @@
 # Queue Model
 
-Understanding the dispatcher's internal queue architecture.
+The Dispatcher is a bounded, single-producer / single-consumer (SPSC) FIFO queue
+built on `collections.deque(maxlen)`. It decouples the MQTT IO thread (producer)
+from the strategy thread (consumer) so that message ingestion never blocks on
+downstream processing.
 
----
-
-## Overview
-
-The Dispatcher uses a **bounded MPMC queue** (multi-producer multi-consumer) with:
-- Fixed capacity (`maxsize`)
-- Non-copying semantics (references only)
-- Lock-based synchronization (Python `queue.Queue`)
-- Configurable overflow policy
-
----
-
-## Queue Implementation
-
-**Type**: `queue.Queue[T]` (standard library)
-
-**Configuration**:
-```python
-dispatcher = Dispatcher(maxsize=10000)
-# Creates queue.Queue(maxsize=10000)
-```
-
-**Why `queue.Queue`?**
-- ✅ Thread-safe (CPython GIL + internal locks)
-- ✅ Blocking and non-blocking operations
-- ✅ Production-proven
-- ✅ Memory-efficient (stores references, not copies)
-
----
-
-## Queue Capacity
-
-### maxsize Parameter
-
-**Contract**: Queue can hold up to `maxsize` events.
+## Bounded Deque
 
 ```python
-dispatcher = Dispatcher(maxsize=100)
+from core.dispatcher import Dispatcher, DispatcherConfig
 
-# Producer puts 100 events → OK
-# Producer puts 101st event → Blocks or rejects (depends on policy)
+cfg = DispatcherConfig(maxlen=50_000)
+dispatcher: Dispatcher[BestBidAsk] = Dispatcher(config=cfg)
 ```
 
-**Test**: `test_dispatcher.py::test_maxsize_enforced`
+The constructor creates a `collections.deque(maxlen=maxlen)` and initialises
+three counters to zero: `_total_pushed`, `_total_polled`, and `_total_dropped`.
+It also initialises the drop-rate EMA to `0.0`.
 
----
+The default `maxlen` is **100 000** entries (`DispatcherConfig.maxlen` with
+`gt=0`).
 
-### Choosing maxsize
+## FIFO Ordering
 
-**Formula**:
-```
-maxsize ≥ (message_rate_per_sec × max_processing_time_sec) × safety_factor
-```
+Events are appended to the right end of the deque via `push()` and consumed from
+the left end via `poll()`. This guarantees strict first-in, first-out delivery
+for all events that survive the overflow policy.
 
-**Example**:
-- Message rate: 1,000 events/sec
-- Max processing time: 0.5 sec (500ms)
-- Safety factor: 20x
+## Core API
 
-```
-maxsize = 1,000 × 0.5 × 20 = 10,000
-```
+| Method | Thread | Description |
+| --- | --- | --- |
+| `push(event)` | MQTT IO thread | Append one event. If the queue is at capacity the oldest event is auto-evicted (see overflow policy). |
+| `poll(max_events=100)` | Strategy thread | Pop up to `max_events` items from the front. Returns `list[T]`. Raises `ValueError` if `max_events <= 0`. |
+| `clear()` | Main thread | Clear the deque and reset **all** counters and the EMA to zero. |
+| `stats()` | Any thread | Return a frozen `DispatcherStats` snapshot. |
+| `health()` | Any thread | Return a frozen `DispatcherHealth` snapshot with drop-rate EMA and queue utilisation. |
 
-**Guidelines**:
-- **Small** (100-1,000): Low-latency strategies, fast processing
-- **Medium** (10,000-50,000): Production systems, moderate bursts
-- **Large** (100,000+): High-frequency, bursty feeds
+## push(event) -- Hot Path
 
-**Memory impact**:
-- BestBidAsk: ~200 bytes/event
-- FullBidOffer: ~440 bytes/event
-- 10,000 events ≈ 2-4 MB
+`push()` is designed to be called on the MQTT IO thread at high frequency. Its
+operation is:
 
----
+1. Check if `len(queue) == maxlen`. If so, increment `_total_dropped` and set
+   `dropped = 1.0`.
+2. Call `queue.append(event)`. The `deque(maxlen)` automatically evicts the
+   oldest element when full.
+3. Increment `_total_pushed`.
+4. Update the drop-rate EMA (see `health_and_ema.md`).
 
-## Queue Operations
+## poll(max_events=100)
 
-### put_nowait(event)
-
-**Behavior**: Add event to queue without blocking.
-
-**Success**: Event added to queue
-
-**Failure**: Raises `queue.Full` if queue is full
+`poll()` pops up to `max_events` items from the front of the deque using
+`popleft()`. It raises `ValueError` if `max_events <= 0`. If the queue is empty
+it returns an empty list. After the loop, `_total_polled` is incremented by the
+number of items actually returned.
 
 ```python
-try:
-    dispatcher._queue.put_nowait(event)
-except queue.Full:
-    # Handle overflow (see overflow_policy.md)
-    handle_overflow(event)
+events: list[BestBidAsk] = dispatcher.poll(max_events=200)
+for e in events:
+    strategy.on_tick(e)
 ```
 
-**Thread-safety**: ✅ Safe to call from multiple threads
+## clear()
 
----
+`clear()` is a lifecycle method intended for use on the main thread (e.g. during
+reconnect). It clears the deque and resets every piece of mutable state:
 
-### get(timeout)
+- `_total_pushed = 0`
+- `_total_polled = 0`
+- `_total_dropped = 0`
+- `_drop_rate_ema = 0.0`
 
-**Behavior**: Remove and return event from queue with timeout.
+After `clear()`, the dispatcher behaves as if freshly constructed.
 
-**Success**: Returns event
+## DispatcherStats
 
-**Timeout**: Raises `queue.Empty` if timeout expires
+`stats()` returns a frozen Pydantic model:
 
 ```python
-try:
-    event = dispatcher._queue.get(timeout=0.1)  # 100ms timeout
-except queue.Empty:
-    # No events available
-    continue
+class DispatcherStats(BaseModel, frozen=True, extra="forbid"):
+    total_pushed: int    # ge=0
+    total_polled: int    # ge=0
+    total_dropped: int   # ge=0
+    queue_len: int       # ge=0
+    maxlen: int          # gt=0
 ```
 
-**Thread-safety**: ✅ Safe to call from multiple threads
+The snapshot is lock-free and eventually consistent.
 
----
+## SPSC Thread-Ownership Contract
 
-### qsize()
+The dispatcher relies on strict thread ownership rather than mutexes:
 
-**Behavior**: Return approximate number of events in queue.
+| Role | Thread | Writable state |
+| --- | --- | --- |
+| Producer | MQTT IO thread | `_total_pushed`, `_total_dropped`, `_drop_rate_ema` |
+| Consumer | Strategy thread | `_total_polled` |
+| Lifecycle | Main thread | `clear()` (not concurrent with push/poll) |
+| Observer | Any thread | Reads only -- `stats()`, `health()` |
 
-**Note**: Result is approximate due to thread-safety semantics.
+Each counter has exactly one writer. CPython int reads are atomic, so observer
+threads always see a valid (though potentially slightly stale) value without
+locks.
 
-```python
-size = dispatcher._queue.qsize()
-print(f"Queue depth: {size}/{dispatcher._maxsize}")
+## Invariant
+
+After every operation the following relationship holds:
+
+```text
+total_pushed - total_dropped - total_polled == len(queue)
 ```
 
-**Use**: Monitoring, health checks
+The private method `_invariant_ok()` checks this condition and is exercised
+extensively in tests.
 
----
+## Memory
 
-## Queue Health Metrics
+The queue stores **references** to event objects, not copies. Memory consumption
+is O(N) where N is `maxlen`. With the default of 100 000 entries this is well
+within normal memory budgets for typical market-data objects.
 
-### Current Depth
+## Generic Typing
 
-**Definition**: Number of events currently in queue.
+The dispatcher is generic over the event type:
 
-```python
-depth = dispatcher._queue.qsize()
-```
-
-**Healthy**: < 50% of maxsize
-
-**Warning**: 50-80% of maxsize
-
-**Critical**: > 80% of maxsize
-
----
-
-### Fill Ratio
-
-**Definition**: Current depth as percentage of capacity.
-
-```python
-fill_ratio = dispatcher._queue.qsize() / dispatcher._maxsize
-```
-
-**Healthy**: < 0.5 (50%)
-
-**Warning**: 0.5 - 0.8
-
-**Critical**: > 0.8
-
----
-
-### Overflow Count
-
-**Definition**: Number of events rejected due to queue full.
-
-**Tracking**:
 ```python
 from core.dispatcher import Dispatcher
 
-dispatcher = Dispatcher(maxsize=100)
-print(f"Overflows: {dispatcher._overflow_count}")  # Tracks rejections
+bid_ask_q: Dispatcher[BestBidAsk] = Dispatcher()
+trade_q: Dispatcher[TradeEvent] = Dispatcher()
 ```
 
-**Test**: `test_dispatcher.py::test_overflow_count_tracked`
+This lets type checkers verify that producers and consumers agree on the event
+type flowing through the queue.
 
----
-
-## Memory Characteristics
-
-### Storage Semantics
-
-**Contract**: Queue stores **references** to events, not copies.
+## DispatcherConfig
 
 ```python
-event = BestBidAsk(...)
-dispatcher.put_if_fits(event)
-# Queue stores reference to `event`, not a copy
+class DispatcherConfig(BaseModel):
+    maxlen: int = 100_000          # gt=0
+    ema_alpha: float = 0.01        # gt=0.0, le=1.0
+    drop_warning_threshold: float = 0.01  # gt=0.0, le=1.0
 ```
 
-**Memory**: O(N) where N = queue depth
-
-**Performance**: O(1) put/get (amortized)
-
----
-
-### Memory Layout
-
-```
-Queue object: ~100 bytes
-+ (N events × reference size)
-+ (N events × event size)
-
-Reference: 8 bytes (CPython 64-bit)
-BestBidAsk: ~200 bytes
-FullBidOffer: ~440 bytes
-
-Total for 10,000 BestBidAsk events:
-  100 + (10,000 × 8) + (10,000 × 200) ≈ 2.08 MB
-```
-
----
-
-## Queue Observability
-
-### Health Check
-
-```python
-def check_queue_health(dispatcher: Dispatcher) -> dict:
-    depth = dispatcher._queue.qsize()
-    capacity = dispatcher._maxsize
-    fill_ratio = depth / capacity if capacity > 0 else 0.0
-    
-    return {
-        "depth": depth,
-        "capacity": capacity,
-        "fill_ratio": fill_ratio,
-        "status": "healthy" if fill_ratio < 0.5 else "warning" if fill_ratio < 0.8 else "critical",
-    }
-```
-
----
-
-### Monitoring Integration
-
-**Prometheus metrics**:
-```python
-from prometheus_client import Gauge
-
-queue_depth = Gauge('dispatcher_queue_depth', 'Current queue depth')
-queue_capacity = Gauge('dispatcher_queue_capacity', 'Queue capacity')
-queue_fill_ratio = Gauge('dispatcher_queue_fill_ratio', 'Queue fill ratio')
-
-# Update metrics
-queue_depth.set(dispatcher._queue.qsize())
-queue_capacity.set(dispatcher._maxsize)
-queue_fill_ratio.set(dispatcher._queue.qsize() / dispatcher._maxsize)
-```
-
----
-
-## Queue Tuning
-
-### Symptoms of Undersized Queue
-
-- Frequent overflow errors
-- High overflow count
-- Events dropped even when consumer is processing
-- `queue.Full` exceptions in logs
-
-**Solution**: Increase `maxsize`
-
----
-
-### Symptoms of Oversized Queue
-
-- High memory usage (> 100 MB for queue)
-- Long processing delays (events stale before consumed)
-- Consumer cannot keep up even with large buffer
-
-**Solution**: Decrease `maxsize` or optimize consumer
-
----
-
-## Implementation Reference
-
-See [core/dispatcher.py](../../core/dispatcher.py):
-- Queue initialization (`__init__`)
-- `put_if_fits()` method
-- `poll()` method
-- Overflow tracking
-
----
+All fields are validated by Pydantic on construction.
 
 ## Test Coverage
 
-Key tests in `test_dispatcher.py`:
-- `test_maxsize_enforced` — Capacity limits
-- `test_put_if_fits_rejects_when_full` — Overflow behavior
-- `test_overflow_count_tracked` — Rejection tracking
-- `test_poll_empty_queue` — Empty queue behavior
+Tests confirm:
 
----
-
-## Next Steps
-
-- **[Overflow Policy](./overflow_policy.md)** — Handling queue full conditions
-- **[Health and EMA](./health_and_ema.md)** — Queue health metrics
-- **[Threading and Concurrency](../01_system_overview/threading_and_concurrency.md)** — Thread-safety details
+- FIFO ordering is preserved for non-dropped events
+- Drop at `maxlen` boundary (oldest evicted)
+- Drop count matches evicted events exactly
+- No drop after `poll()` frees space
+- `maxlen=1` edge case: every push after the first drops
+- `clear()` resets everything
+- `poll(0)` and `poll(-1)` raise `ValueError`
+- Concurrent push/poll from separate threads is safe
+- Invariant holds after all operations

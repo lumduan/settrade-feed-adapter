@@ -1,513 +1,161 @@
 # Metrics Reference
 
-Comprehensive reference for all system metrics.
+Complete catalog of all metrics exposed by the feed adapter components.
 
 ---
 
 ## Overview
 
-This document catalogs all metrics emitted by the feed adapter for monitoring and observability.
+Each component exposes metrics through a `stats()` or `health()` method that
+returns a snapshot (dict or frozen Pydantic model). There is no external
+metrics library dependency -- consumers pull metrics on demand.
 
-**Metric types**:
-- **Counter**: Monotonically increasing value (e.g., total events)
-- **Gauge**: Point-in-time measurement (e.g., queue depth)
-- **Histogram**: Distribution of values (e.g., latency percentiles)
+---
+
+## Transport Metrics
+
+Source: `infra/settrade_mqtt.py` -- `SettradeMQTTClient.stats()`
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `messages_received` | Counter | Total MQTT messages received across all topics. Incremented under `_counter_lock` in the IO thread. |
+| `callback_errors` | Counter | Total errors caught in per-callback `try/except` during message dispatch. Each failed callback increments this once. |
+| `reconnect_count` | Counter | Total successful TCP-level reconnect attempts. Incremented in `_reconnect_loop` after `connect()` returns. |
+| `reconnect_epoch` | Counter | Reconnect version counter. Starts at 0 for initial connection. Incremented by 1 after each successful reconnect and subscription replay. Strategy code compares `event.connection_epoch` against this. |
+| `state` | Gauge | Current `ClientState` value: `INIT`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, or `SHUTDOWN`. |
+| `connected` | Gauge | Boolean (`True`/`False`) indicating whether state is `CONNECTED`. |
+| `last_connect_ts` | Gauge | `time.time()` wall-clock timestamp of the most recent successful connection. `0.0` if never connected. |
+| `last_disconnect_ts` | Gauge | `time.time()` wall-clock timestamp of the most recent disconnection. `0.0` if never disconnected. |
+
+Access:
+
+```python
+stats = mqtt_client.stats()
+stats["messages_received"]   # int
+stats["reconnect_epoch"]     # int
+stats["state"]               # str
+```
+
+---
+
+## Adapter Metrics
+
+Source: `infra/settrade_adapter.py` -- `BidOfferAdapter.stats()`
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `messages_parsed` | Counter | Total messages successfully parsed and delivered to callback. Incremented only when both parse and callback succeed. |
+| `parse_errors` | Counter | Total protobuf parse failures. Incremented in the `except` block of the parse phase. Does not overlap with `callback_errors`. |
+| `callback_errors` | Counter | Total downstream callback failures. Incremented in the `except` block of the callback phase. Does not overlap with `parse_errors`. |
+| `subscribed_symbols` | Gauge | Sorted list of currently subscribed symbol strings. Snapshot taken under `_sub_lock`. |
+| `full_depth` | Gauge | Boolean indicating whether `FullBidOffer` (10-level) or `BestBidAsk` (top-of-book) events are produced. |
+
+Error isolation guarantee: each message increments exactly one of
+`messages_parsed`, `parse_errors`, or `callback_errors`.
+
+Access:
+
+```python
+stats = adapter.stats()
+stats["messages_parsed"]       # int
+stats["parse_errors"]          # int
+stats["callback_errors"]       # int
+stats["subscribed_symbols"]    # list[str]
+stats["full_depth"]            # bool
+```
 
 ---
 
 ## Dispatcher Metrics
 
-### dispatcher_queue_depth (Gauge)
+Source: `core/dispatcher.py` -- `Dispatcher.stats()` and `Dispatcher.health()`
 
-**Description**: Current number of events in dispatcher queue.
+### Stats (via `stats()`)
 
-**Unit**: Events
+Returns a frozen `DispatcherStats` Pydantic model.
 
-**Range**: [0, maxsize]
+| Metric | Type | Description |
+| --- | --- | --- |
+| `total_pushed` | Counter | Total events pushed into the queue, including those that caused a drop. Single-writer: push thread only. |
+| `total_polled` | Counter | Total events consumed via `poll()`. Single-writer: poll thread only. |
+| `total_dropped` | Counter | Total events dropped due to queue overflow. Each drop means the oldest event was evicted by a new push. Single-writer: push thread only. |
+| `queue_len` | Gauge | Current number of events in the queue. Eventually consistent with counter values. |
+| `maxlen` | Gauge | Configured maximum queue length. |
 
-**Labels**: None
+Invariant (under quiescent conditions):
 
-**Healthy**: < 50% of maxsize
-
-**Example**:
-```python
-from prometheus_client import Gauge
-
-queue_depth = Gauge('dispatcher_queue_depth', 'Current queue depth')
-queue_depth.set(dispatcher._queue.qsize())
+```text
+total_pushed - total_dropped - total_polled == queue_len
 ```
 
----
+### Health (via `health()`)
 
-### dispatcher_queue_capacity (Gauge)
+Returns a frozen `DispatcherHealth` Pydantic model.
 
-**Description**: Maximum queue capacity (`maxsize`).
+| Metric | Type | Description |
+| --- | --- | --- |
+| `drop_rate_ema` | Gauge | Exponential moving average of drop rate. `0.0` = no drops, `1.0` = every push drops. Updated on each `push()`. Formula: `ema = alpha * sample + (1 - alpha) * ema` where sample is 1.0 on drop, 0.0 otherwise. |
+| `queue_utilization` | Gauge | Current queue fill ratio: `len(queue) / maxlen`. Range `[0.0, 1.0]`. |
+| `total_dropped` | Counter | Same as in stats -- cumulative drops since last `clear()`. |
+| `total_pushed` | Counter | Same as in stats -- cumulative pushes since last `clear()`. |
 
-**Unit**: Events
+Access:
 
-**Range**: [1, ∞)
-
-**Labels**: None
-
-**Example**:
 ```python
-from prometheus_client import Gauge
+stats = dispatcher.stats()
+stats.total_pushed      # int
+stats.total_dropped     # int
+stats.queue_len         # int
 
-queue_capacity = Gauge('dispatcher_queue_capacity', 'Queue capacity')
-queue_capacity.set(dispatcher._maxsize)
-```
-
----
-
-### dispatcher_queue_fill_ratio (Gauge)
-
-**Description**: Queue depth as fraction of capacity.
-
-**Unit**: Ratio (0.0 to 1.0)
-
-**Range**: [0.0, 1.0]
-
-**Labels**: None
-
-**Healthy**: < 0.5
-
-**Warning**: 0.5 - 0.8
-
-**Critical**: > 0.8
-
-**Example**:
-```python
-from prometheus_client import Gauge
-
-fill_ratio = Gauge('dispatcher_queue_fill_ratio', 'Queue fill ratio')
-fill_ratio.set(dispatcher._queue.qsize() / dispatcher._maxsize)
-```
-
----
-
-### dispatcher_overflow_total (Counter)
-
-**Description**: Total number of events dropped due to queue full.
-
-**Unit**: Events
-
-**Range**: [0, ∞)
-
-**Labels**: None
-
-**Healthy**: 0
-
-**Warning**: > 0
-
-**Example**:
-```python
-from prometheus_client import Counter
-
-overflow_counter = Counter('dispatcher_overflow_total', 'Total events dropped')
-overflow_counter.inc()  # Increment on overflow
-```
-
----
-
-### dispatcher_events_received_total (Counter)
-
-**Description**: Total number of events received (all symbols).
-
-**Unit**: Events
-
-**Range**: [0, ∞)
-
-**Labels**: `symbol` (optional)
-
-**Example**:
-```python
-from prometheus_client import Counter
-
-events_counter = Counter(
-    'dispatcher_events_received_total',
-    'Total events received',
-    ['symbol']
-)
-
-events_counter.labels(symbol="AOT").inc()
+health = dispatcher.health()
+health.drop_rate_ema        # float
+health.queue_utilization    # float
 ```
 
 ---
 
 ## Feed Health Metrics
 
-### feed_global_alive (Gauge)
+Source: `core/feed_health.py` -- `FeedHealthMonitor` methods
 
-**Description**: Global feed liveness (1=alive, 0=stale).
+The feed health monitor does not have a single `stats()` method. Instead,
+metrics are queried individually:
 
-**Unit**: Boolean (0 or 1)
+| Metric | Method | Return Type | Description |
+| --- | --- | --- | --- |
+| Feed dead | `is_feed_dead(now_ns)` | `bool` | `True` if gap since last global event exceeds `max_gap_seconds`. `False` before first event. |
+| Stale symbols | `stale_symbols(now_ns)` | `list[str]` | All symbols whose gap exceeds their threshold. O(N) scan. |
+| Tracked count | `tracked_symbol_count()` | `int` | Number of distinct symbols recorded via `on_event()`. |
+| Ever received | `has_ever_received()` | `bool` | `True` if at least one event was recorded. Distinguishes startup from healthy. |
+| Symbol seen | `has_seen(symbol)` | `bool` | `True` if the specific symbol was ever recorded. |
+| Symbol stale | `is_stale(symbol, now_ns)` | `bool` | `True` if the symbol was seen before and its gap exceeds threshold. |
+| Symbol gap | `last_seen_gap_ms(symbol, now_ns)` | `float or None` | Gap in milliseconds since last event for a symbol. `None` if never seen. |
 
-**Range**: {0, 1}
+Access:
 
-**Labels**: None
-
-**Healthy**: 1
-
-**Critical**: 0
-
-**Example**:
 ```python
-from prometheus_client import Gauge
-
-feed_alive = Gauge('feed_global_alive', 'Feed global liveness')
-feed_alive.set(1 if feed_health.is_alive() else 0)
+monitor.is_feed_dead()                   # bool
+monitor.stale_symbols()                  # list[str]
+monitor.tracked_symbol_count()           # int
+monitor.last_seen_gap_ms("PTT")          # float or None
 ```
 
 ---
 
-### feed_symbol_alive (Gauge)
+## Metric Consistency
 
-**Description**: Per-symbol liveness (1=alive, 0=stale).
+All metrics are **eventually consistent**. Under concurrent access, counter
+reads may reflect slightly different points in time. Under quiescent
+conditions (no concurrent push/poll), all invariants hold exactly.
 
-**Unit**: Boolean (0 or 1)
-
-**Range**: {0, 1}
-
-**Labels**: `symbol`
-
-**Healthy**: 1
-
-**Warning**: 0
-
-**Example**:
-```python
-from prometheus_client import Gauge
-
-symbol_alive = Gauge(
-    'feed_symbol_alive',
-    'Symbol liveness',
-    ['symbol']
-)
-
-for symbol in tracked_symbols:
-    is_alive = feed_health.is_symbol_alive(symbol)
-    symbol_alive.labels(symbol=symbol).set(1 if is_alive else 0)
-```
+Transport and adapter metrics use `threading.Lock` for thread-safe snapshots.
+Dispatcher metrics are lock-free (CPython GIL-atomic int reads). Feed health
+metrics are not thread-safe and must be read from the strategy thread only.
 
 ---
 
-### feed_global_last_event_seconds_ago (Gauge)
-
-**Description**: Seconds since last event (any symbol).
-
-**Unit**: Seconds
-
-**Range**: [0, ∞)
-
-**Labels**: None
-
-**Healthy**: < global_timeout
-
-**Example**:
-```python
-import time
-from prometheus_client import Gauge
-
-last_event_ago = Gauge('feed_global_last_event_seconds_ago', 'Seconds since last event')
-
-now = time.time()
-last_ts = feed_health._global_last_event_time
-last_event_ago.set(now - last_ts if last_ts else float('inf'))
-```
-
----
-
-### feed_symbol_last_event_seconds_ago (Gauge)
-
-**Description**: Seconds since last event for specific symbol.
-
-**Unit**: Seconds
-
-**Range**: [0, ∞)
-
-**Labels**: `symbol`
-
-**Healthy**: < symbol_timeout
-
-**Example**:
-```python
-import time
-from prometheus_client import Gauge
-
-symbol_last_event_ago = Gauge(
-    'feed_symbol_last_event_seconds_ago',
-    'Seconds since last event for symbol',
-    ['symbol']
-)
-
-now = time.time()
-for symbol in tracked_symbols:
-    last_ts = feed_health._symbol_timestamps.get(symbol)
-    age = now - last_ts if last_ts else float('inf')
-    symbol_last_event_ago.labels(symbol=symbol).set(age)
-```
-
----
-
-## MQTT Metrics
-
-### mqtt_connected (Gauge)
-
-**Description**: MQTT connection status (1=connected, 0=disconnected).
-
-**Unit**: Boolean (0 or 1)
-
-**Range**: {0, 1}
-
-**Labels**: None
-
-**Healthy**: 1
-
-**Critical**: 0
-
-**Example**:
-```python
-from prometheus_client import Gauge
-
-mqtt_connected = Gauge('mqtt_connected', 'MQTT connection status')
-mqtt_connected.set(1 if client.is_connected() else 0)
-```
-
----
-
-### mqtt_reconnect_total (Counter)
-
-**Description**: Total number of MQTT reconnects.
-
-**Unit**: Reconnects
-
-**Range**: [0, ∞)
-
-**Labels**: None
-
-**Healthy**: Low value (< 10 per day)
-
-**Warning**: > 10 per day
-
-**Example**:
-```python
-from prometheus_client import Counter
-
-reconnect_counter = Counter('mqtt_reconnect_total', 'Total MQTT reconnects')
-reconnect_counter.inc()  # Increment on reconnect
-```
-
----
-
-### mqtt_subscription_total (Counter)
-
-**Description**: Total number of symbol subscriptions.
-
-**Unit**: Subscriptions
-
-**Range**: [0, ∞)
-
-**Labels**: `symbol` (optional)
-
-**Example**:
-```python
-from prometheus_client import Counter
-
-subscription_counter = Counter(
-    'mqtt_subscription_total',
-    'Total subscriptions',
-    ['symbol']
-)
-
-subscription_counter.labels(symbol="AOT").inc()
-```
-
----
-
-## Latency Metrics
-
-### event_processing_latency_seconds (Histogram)
-
-**Description**: Time from event receipt to processing completion.
-
-**Unit**: Seconds
-
-**Range**: [0, ∞)
-
-**Labels**: `symbol` (optional), `event_type`
-
-**Buckets**: 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1
-
-**Healthy**: p99 < 0.001 (1ms)
-
-**Example**:
-```python
-import time
-from prometheus_client import Histogram
-
-processing_latency = Histogram(
-    'event_processing_latency_seconds',
-    'Event processing latency',
-    ['symbol', 'event_type'],
-    buckets=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
-)
-
-start = time.perf_counter()
-process_event(event)
-duration = time.perf_counter() - start
-
-processing_latency.labels(
-    symbol=event.symbol,
-    event_type=type(event).__name__
-).observe(duration)
-```
-
----
-
-### mqtt_message_receive_latency_seconds (Histogram)
-
-**Description**: Time from MQTT message arrival to adapter processing.
-
-**Unit**: Seconds
-
-**Range**: [0, ∞)
-
-**Labels**: None
-
-**Buckets**: 0.00001, 0.00005, 0.0001, 0.0005, 0.001
-
-**Healthy**: p99 < 0.0001 (100µs)
-
----
-
-## Performance Metrics
-
-### event_parse_duration_seconds (Histogram)
-
-**Description**: Time to parse raw protobuf message.
-
-**Unit**: Seconds range**: [0, ∞)
-
-**Labels**: `message_type`
-
-**Buckets**: 0.000001, 0.000005, 0.00001, 0.00005, 0.0001
-
-**Healthy**: p99 < 0.00001 (10µs)
-
----
-
-### event_normalize_duration_seconds (Histogram)
-
-**Description**: Time to normalize parsed message to event model.
-
-**Unit**: Seconds
-
-**Range**: [0, ∞)
-
-**Labels**: `event_type`
-
-**Buckets**: 0.000001, 0.000005, 0.00001, 0.00005, 0.0001
-
-**Healthy**: p99 < 0.00005 (50µs)
-
----
-
-## System Metrics
-
-### python_gc_collections_total (Counter)
-
-**Description**: Total garbage collection runs (by generation).
-
-**Unit**: Collections
-
-**Range**: [0, ∞)
-
-**Labels**: `generation`
-
-**Source**: CPython `gc` module
-
-**Example**:
-```python
-import gc
-from prometheus_client import Counter
-
-gc_counter = Counter(
-    'python_gc_collections_total',
-    'Total GC collections',
-    ['generation']
-)
-
-for gen in [0, 1, 2]:
-    gc_counter.labels(generation=str(gen)).inc(gc.get_count()[gen])
-```
-
----
-
-### process_cpu_seconds_total (Counter)
-
-**Description**: Total CPU time consumed by process.
-
-**Unit**: Seconds
-
-**Range**: [0, ∞)
-
-**Labels**: None
-
-**Source**: `/proc/self/stat` or `resource` module
-
----
-
-### process_resident_memory_bytes (Gauge)
-
-**Description**: Resident memory (RSS) usage.
-
-**Unit**: Bytes
-
-**Range**: [0, ∞)
-
-**Labels**: None
-
-**Healthy**: < 500 MB for typical workload
-
----
-
-## Prometheus Export Example
-
-```python
-from prometheus_client import start_http_server, Gauge, Counter, Histogram
-import time
-
-# Start metrics server
-start_http_server(8000)
-
-# Define metrics
-queue_depth = Gauge('dispatcher_queue_depth', 'Current queue depth')
-events_counter = Counter('dispatcher_events_received_total', 'Total events')
-feed_alive = Gauge('feed_global_alive', 'Feed liveness')
-
-# Update loop
-while True:
-    queue_depth.set(dispatcher._queue.qsize())
-    feed_alive.set(1 if feed_health.is_alive() else 0)
-    
-    time.sleep(1.0)  # Update every second
-
-# Metrics available at http://localhost:8000/metrics
-```
-
----
-
-## Implementation Reference
-
-See:
-- [core/dispatcher.py](../../core/dispatcher.py) — Dispatcher metrics
-- [core/feed_health.py](../../core/feed_health.py) — Feed health metrics
-- [infra/settrade_mqtt.py](../../infra/settrade_mqtt.py) — MQTT metrics
-
----
-
-## Next Steps
-
-- **[Logging Policy](./logging_policy.md)** — Log message formatting
-- **[Benchmark Guide](./benchmark_guide.md)** — Performance measurement
-- **[Performance Targets](./performance_targets.md)** — Target latencies
+## Related Pages
+
+- [Logging Policy](./logging_policy.md) -- log levels and rate limiting
+- [Benchmark Guide](./benchmark_guide.md) -- performance measurement
+- [Tuning Guide](../09_production_guide/tuning_guide.md) -- configuring thresholds

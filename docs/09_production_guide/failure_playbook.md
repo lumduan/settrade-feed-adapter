@@ -1,574 +1,203 @@
 # Failure Playbook
 
-Troubleshooting guide for production issues.
+Operational troubleshooting guide for production issues.
 
 ---
 
-## Overview
+## Drop Rate Rising
 
-This playbook provides step-by-step troubleshooting for common production failures.
+**Symptom:** `dispatcher.health().drop_rate_ema` is above threshold, warning
+log appears: `Drop rate EMA X.XXXX exceeds threshold X.XXXX`.
 
-**Organization**: Symptom → Diagnosis → Resolution
+**Diagnosis:**
 
----
+1. Check `dispatcher.stats().queue_len` -- is the queue consistently full?
+2. Check consumer throughput -- is the strategy processing events fast enough?
+3. Check message rate -- has the market entered a high-activity period?
 
-## Connection Issues
+**Actions:**
 
-### Symptom: MQTT Won't Connect
+- **Immediate:** Increase `maxlen` in `DispatcherConfig` to absorb bursts.
+- **Short-term:** Optimize strategy processing time to consume events faster.
+- **Long-term:** Profile the strategy loop to find bottlenecks. Consider
+  reducing subscribed symbols or switching from `FullBidOffer` to `BestBidAsk`.
 
-**Indicators**:
-- "Connection refused" error
-- "Connection timeout" error
-- `mqtt_connected` metric = 0
+**Metrics to watch:**
 
-**Diagnosis**:
-
-1. **Check broker reachability**:
-```bash
-ping mqtt.settrade.com
-```
-
-2. **Check port open**:
-```bash
-telnet mqtt.settrade.com 8883
-# or
-nc -zv mqtt.settrade.com 8883
-```
-
-3. **Check API token**:
 ```python
-import os
-print(os.getenv("API_TOKEN"))  # Should not be empty
-```
+health = dispatcher.health()
+health.drop_rate_ema        # should trend toward 0
+health.queue_utilization    # should stay below 0.8
 
-4. **Check TLS certificate**:
-```bash
-openssl s_client -connect mqtt.settrade.com:8883 -showcerts
-```
-
-**Resolution**:
-
-**If broker unreachable**:
-- Check network connectivity
-- Verify firewall rules
-- Contact Settrade support
-
-**If token invalid**:
-- Regenerate API token from Settrade portal
-- Update environment variable: `export API_TOKEN=new_token`
-
-**If TLS error**:
-- Update CA certificates: `sudo update-ca-certificates`
-- Check system time: `date` (must be synchronized)
-
----
-
-### Symptom: Frequent Reconnects
-
-**Indicators**:
-- `mqtt_reconnect_total` counter increasing rapidly
-- "Disconnected" → "Reconnecting" log spam
-- `connection_epoch` incrementing frequently
-
-**Diagnosis**:
-
-1. **Check network stability**:
-```bash
-ping -c 100 mqtt.settrade.com | tail -1
-# Look for packet loss
-```
-
-2. **Check broker logs** (if accessible):
-```
-# Look for "client kicked" or "quota exceeded"
-```
-
-3. **Monitor reconnect pattern**:
-```python
-import time
-
-last_epoch = 0
-for event in dispatcher.poll():
-    if event.connection_epoch != last_epoch:
-        print(f"Reconnect at {time.time()}")
-        last_epoch = event.connection_epoch
-```
-
-**Resolution**:
-
-**If network unstable**:
-- Switch to wired connection (avoid WiFi)
-- Check with ISP for connectivity issues
-- Use different network route
-
-**If broker-side issue**:
-- Contact Settrade support
-- Check for server maintenance schedule
-
-**If too many connections**:
-- Reduce connection rate
-- Implement connection pooling
-- Check for duplicate clients
-
----
-
-## Data Flow Issues
-
-### Symptom: No Events Received
-
-**Indicators**:
-- `feed_global_alive` = 0
-- `dispatcher_events_received_total` not increasing
-- Empty queue (`dispatcher._queue.qsize()` = 0)
-
-**Diagnosis**:
-
-1. **Check connection status**:
-```python
-assert client.is_connected()  # Should be True
-```
-
-2. **Check subscriptions**:
-```python
-# Verify symbols subscribed
-print(client._subscribed_symbols)  # Should not be empty
-```
-
-3. **Check MQTT message receipt**:
-```python
-# Add logging to on_message callback
-def on_message(client, userdata, msg):
-    print(f"Received: {msg.topic}")  # Should print messages
-    ...
-```
-
-4. **Check parse errors**:
-```bash
-# Look for parse error logs
-grep "Failed to parse" logs/feed_adapter.log
-```
-
-**Resolution**:
-
-**If not connected**:
-- See "MQTT Won't Connect" above
-
-**If not subscribed**:
-- Resubscribe to symbols:
-```python
-client.subscribe_to_symbols(["AOT", "PTT"])
-```
-
-**If messages not reaching callback**:
-- Check topic wildcards correct: `/quote/bidoffer/+/+`
-- Verify broker sending data (use MQTT client tester)
-
-**If parse errors**:
-- Check protobuf schema version matches broker
-- Update `settrade_v2` package: `uv pip install --upgrade settrade-v2`
-
----
-
-### Symptom: Events Delayed
-
-**Indicators**:
-- High end-to-end latency (> 1 sec)
-- `dispatcher_queue_depth` near maxsize
-- Consumer falling behind
-
-**Diagnosis**:
-
-1. **Check queue depth**:
-```python
-depth = dispatcher._queue.qsize()
-fill_ratio = depth / dispatcher._maxsize
-print(f"Queue: {depth}/{dispatcher._maxsize} ({fill_ratio:.1%})")
-```
-
-2. **Check consumer processing time**:
-```python
-import time
-
-start = time.perf_counter()
-for event in dispatcher.poll(timeout=1.0):
-    process_event(event)
-    duration = time.perf_counter() - start
-    if duration > 0.01:  # 10ms threshold
-        print(f"Slow processing: {duration*1000:.2f}ms")
-    start = time.perf_counter()
-```
-
-3. **Profile consumer code**:
-```bash
-python -m cProfile -o profile.stats main.py
-python -c "import pstats; pstats.Stats('profile.stats').sort_stats('cumulative').print_stats(10)"
-```
-
-**Resolution**:
-
-**If queue filling up**:
-- Increase maxsize:
-```python
-dispatcher = Dispatcher(maxsize=50000)  # Was 10000
-```
-
-**If consumer too slow**:
-- Optimize processing logic (remove database calls, etc.)
-- Add more consumer threads:
-```python
-threads = [threading.Thread(target=consumer) for _ in range(4)]
-```
-
-**If GC pauses**:
-- Tune GC thresholds:
-```python
-import gc
-gc.set_threshold(10000, 20, 20)
+stats = dispatcher.stats()
+stats.total_dropped         # cumulative drops
+stats.queue_len             # current depth
 ```
 
 ---
 
-### Symptom: Events Dropped (Overflow)
+## Feed Declared Dead
 
-**Indicators**:
-- `dispatcher_overflow_total` > 0
-- "Dispatcher overflow" warnings in logs
-- Queue full (`fill_ratio` = 1.0)
+**Symptom:** `monitor.is_feed_dead()` returns `True`.
 
-**Diagnosis**:
+**Diagnosis:**
 
-1. **Check overflow count**:
+1. Check `mqtt_client.stats()["state"]` -- is the client still `CONNECTED`?
+2. Check `mqtt_client.stats()["messages_received"]` -- is the count still
+   increasing?
+3. Check market hours -- is the exchange currently open?
+4. Check `adapter.subscribed_symbols` -- are symbols still subscribed?
+
+**Actions:**
+
+- **If state is not CONNECTED:** Wait for auto-reconnect. Check
+  `reconnect_count` to confirm reconnect attempts are happening.
+- **If state is CONNECTED but no messages:** Verify subscriptions are active.
+  Check if the exchange is in a halt or non-trading period.
+- **If market is closed:** Increase `max_gap_seconds` for after-hours
+  monitoring, or accept that `is_feed_dead()` will return `True` outside
+  trading hours.
+
+**Metrics to watch:**
+
 ```python
-print(f"Overflows: {dispatcher._overflow_count}")
-```
+mqtt_stats = mqtt_client.stats()
+mqtt_stats["state"]              # should be "CONNECTED"
+mqtt_stats["messages_received"]  # should be increasing
 
-2. **Calculate overflow rate**:
-```python
-import time
-
-last_overflow = dispatcher._overflow_count
-last_time = time.time()
-
-time.sleep(10)  # Wait 10 seconds
-
-now = time.time()
-overflow_rate = (dispatcher._overflow_count - last_overflow) / (now - last_time)
-print(f"Overflow rate: {overflow_rate:.2f} events/sec")
-```
-
-3. **Check consumer thread alive**:
-```python
-import threading
-
-consumer_thread = threading.Thread(target=consumer, daemon=True)
-consumer_thread.start()
-
-# Later
-assert consumer_thread.is_alive()  # Should be True
-```
-
-**Resolution**:
-
-**Immediate** (stop the bleeding):
-- Increase maxsize temporarily:
-```python
-dispatcher = Dispatcher(maxsize=100000)  # Emergency increase
-```
-
-**Short-term** (optimize consumer):
-- Reduce processing per event
-- Add more consumer threads
-- Filter unnecessary symbols
-
-**Long-term** (capacity planning):
-- Right-size maxsize based on load:
-```
-maxsize = peak_rate × max_latency × safety_factor
+monitor.has_ever_received()      # True if feed was ever active
+monitor.stale_symbols()          # which symbols are stale
 ```
 
 ---
 
-## Health Monitoring Issues
+## Reconnect Storm
 
-### Symptom: False "Feed Stale" Alerts
+**Symptom:** `reconnect_count` increasing rapidly, repeated log entries for
+`Reconnect attempt` and `Reconnect attempt failed`.
 
-**Indicators**:
-- `feed_global_alive` = 0 but events are arriving
-- "Feed is stale" alerts during normal operation
+**Diagnosis:**
 
-**Diagnosis**:
+1. Check credential validity -- have API keys expired or been revoked?
+2. Check network connectivity -- can the host reach the Settrade API?
+3. Check broker status -- is the Settrade service experiencing an outage?
+4. Look at the exception in `Reconnect attempt failed` logs for specific
+   error details.
 
-1. **Check timeout configuration**:
+**Actions:**
+
+- **If credentials invalid:** Update `app_id`, `app_secret`, `app_code`, or
+  `broker_id` and restart.
+- **If network unstable:** Increase `reconnect_max_delay` to reduce retry
+  frequency and broker load.
+- **If broker outage:** Wait for service recovery. The exponential backoff
+  will automatically reduce retry frequency up to `reconnect_max_delay`.
+
+**Metrics to watch:**
+
 ```python
-print(f"Global timeout: {feed_health._global_timeout_sec}s")
-```
-
-2. **Check last event time**:
-```python
-import time
-
-last_event_time = feed_health._global_last_event_time
-now = time.time()
-age = now - last_event_time if last_event_time else float('inf')
-
-print(f"Last event: {age:.2f}s ago")
-```
-
-3. **Check if events being recorded**:
-```python
-# Verify record_event() called
-def on_message(...):
-    feed_health.record_event(event.symbol)  # This must be present
-    ...
-```
-
-**Resolution**:
-
-**If timeout too short**:
-- Increase `global_timeout_sec`:
-```python
-feed_health = FeedHealth(global_timeout_sec=10.0)  # Was 5.0
-```
-
-**If events not recorded**:
-- Ensure `record_event()` called for every event:
-```python
-for event in dispatcher.poll():
-    feed_health.record_event(event.symbol)  # Add this
-    process_event(event)
+mqtt_stats = mqtt_client.stats()
+mqtt_stats["reconnect_count"]      # total reconnect attempts
+mqtt_stats["last_connect_ts"]      # when was last successful connect
+mqtt_stats["last_disconnect_ts"]   # when was last disconnect
 ```
 
 ---
 
-### Symptom: Symbol Incorrectly Marked Stale
+## Parse Errors Spiking
 
-**Indicators**:
-- `is_symbol_alive(symbol)` returns `False` but symbol is updating
-- Symbol-specific stale alerts for active symbols
+**Symptom:** `adapter.stats()["parse_errors"]` increasing, log entries for
+`Failed to parse BidOfferV3` (first 10 with stack trace) or
+`Parse errors ongoing: N total` (every 1000th).
 
-**Diagnosis**:
+**Diagnosis:**
 
-1. **Check symbol timeout**:
+1. Check the stack trace from the first few errors -- what exception is thrown?
+2. Check if the protobuf schema has changed (SDK update, broker-side change).
+3. Check if non-BidOfferV3 messages are arriving on the subscribed topics.
+
+**Actions:**
+
+- **If protobuf incompatibility:** Update the `settrade_v2` package to match
+  the broker's protobuf schema.
+- **If wrong message type:** Verify subscription topics are correct
+  (`proto/topic/bidofferv3/{symbol}`).
+- **If corrupted payloads:** Check network path for packet corruption.
+  Monitor `mqtt_client.stats()["callback_errors"]` at the transport level.
+
+**Metrics to watch:**
+
 ```python
-print(f"Symbol timeout: {feed_health._symbol_timeout_sec}s")
-```
-
-2. **Check last event for symbol**:
-```python
-import time
-
-last_ts = feed_health._symbol_timestamps.get("AOT")
-now = time.time()
-age = now - last_ts if last_ts else float('inf')
-
-print(f"AOT last event: {age:.2f}s ago")
-```
-
-3. **Monitor symbol update rate**:
-```python
-from collections import defaultdict
-import time
-
-symbol_counts = defaultdict(int)
-
-for event in dispatcher.poll():
-    symbol_counts[event.symbol] += 1
-    if event.symbol == "AOT" and symbol_counts["AOT"] % 100 == 0:
-        print(f"AOT: {symbol_counts['AOT']} events")
-```
-
-**Resolution**:
-
-**If symbol illiquid** (few updates):
-- Increase `symbol_timeout_sec`:
-```python
-feed_health = FeedHealth(symbol_timeout_sec=60.0)  # Was 10.0
-```
-
-**If after-hours** (low activity):
-- Use different timeout for off-hours:
-```python
-import datetime
-
-hour = datetime.datetime.now().hour
-if hour < 9 or hour >= 17:  # Outside 9 AM - 5 PM
-    feed_health = FeedHealth(symbol_timeout_sec=120.0)
-else:
-    feed_health = FeedHealth(symbol_timeout_sec=10.0)
+adapter_stats = adapter.stats()
+adapter_stats["parse_errors"]      # should be 0
+adapter_stats["callback_errors"]   # should be 0
+adapter_stats["messages_parsed"]   # should be increasing
 ```
 
 ---
 
-## Performance Issues
+## Callback Errors Spiking
 
-### Symptom: High CPU Usage
+**Symptom:** `adapter.stats()["callback_errors"]` increasing.
 
-**Indicators**:
-- CPU > 80% sustained
-- Process consuming multiple cores
-- System becomes unresponsive
+**Diagnosis:**
 
-**Diagnosis**:
+1. Check the stack trace from the first few errors -- the `on_event` callback
+   (typically `dispatcher.push()`) is failing.
+2. Common cause: an exception in the strategy code that `push()` calls.
 
-1. **Profile CPU usage**:
-```bash
-# Install py-spy
-pip install py-spy
+**Actions:**
 
-# Profile running process
-py-spy top --pid $(pgrep -f main.py)
-
-# Generate flame graph
-py-spy record -o flamegraph.svg --pid $(pgrep -f main.py) -- sleep 30
-```
-
-2. **Check message rate**:
-```python
-import time
-
-start_count = total_events
-start_time = time.time()
-
-time.sleep(10)
-
-rate = (total_events - start_count) / (time.time() - start_time)
-print(f"Message rate: {rate:.2f} events/sec")
-```
-
-3. **Check thread count**:
-```bash
-ps -T -p $(pgrep -f main.py) | wc -l
-```
-
-**Resolution**:
-
-**If too many threads**:
-- Reduce consumer thread count:
-```python
-# Was 8 threads
-threads = [threading.Thread(target=consumer) for _ in range(4)]  # Now 4
-```
-
-**If GIL contention**:
-- Use single-threaded consumer (avoid GIL)
-- Consider multiprocessing (separate processes)
-
-**If hot loop**:
-- Optimize processing logic (identified via profiling)
-- Add sleep in tight loops:
-```python
-for event in dispatcher.poll(timeout=0.001):  # 1ms sleep if empty
-    process_event(event)
-```
+- Review the `on_event` callback implementation. Ensure it does not raise
+  exceptions.
+- If the callback is `dispatcher.push()`, check that the dispatcher has not
+  been cleared or replaced mid-stream.
 
 ---
 
-### Symptom: High Memory Usage
+## High Queue Utilization Without Drops
 
-**Indicators**:
-- RSS > 500 MB
-- Memory growing over time (leak)
-- OOM killer triggers
+**Symptom:** `dispatcher.health().queue_utilization` approaching 1.0 but
+`total_dropped` is still 0.
 
-**Diagnosis**:
+**Diagnosis:**
 
-1. **Check queue size**:
-```python
-queue_memory = dispatcher._queue.qsize() * 200  # bytes per event
-print(f"Queue memory: {queue_memory / 1024**2:.2f} MB")
-```
+The queue is filling up but has not yet overflowed. This is a warning sign
+that drops are imminent.
 
-2. **Profile memory**:
-```bash
-# Install memory_profiler
-pip install memory-profiler
+**Actions:**
 
-# Profile code
-python -m memory_profiler main.py
-```
-
-3. **Check for leaks**:
-```python
-import gc
-import sys
-
-# Force GC
-gc.collect()
-
-# Count objects
-print(f"Object count: {len(gc.get_objects())}")
-
-# Find largest objects
-import objgraph
-objgraph.show_most_common_types(limit=10)
-```
-
-**Resolution**:
-
-**If queue too large**:
-- Reduce maxsize:
-```python
-dispatcher = Dispatcher(maxsize=10000)  # Was 100000
-```
-
-**If memory leak**:
-- Identify leak source (via profiling)
-- Add object cleanup:
-```python
-del event  # Explicit cleanup
-gc.collect()  # Force GC
-```
-
-**If Python overhead**:
-- Run with `-O` flag (disable debug overhead)
-- Consider PyPy (JIT compiler)
+- Increase poll frequency or batch size in the strategy.
+- Increase `maxlen` as a buffer.
+- Profile the strategy to identify processing bottlenecks.
 
 ---
 
-## Contact & Escalation
+## Stale Individual Symbols
 
-If issues persist:
+**Symptom:** `monitor.stale_symbols()` returns specific symbols while
+`is_feed_dead()` returns `False`.
 
-1. **Check logs**:
-```bash
-tail -f logs/feed_adapter.log | grep -i error
-```
+**Diagnosis:**
 
-2. **Collect diagnostics**:
-```bash
-# System info
-uname -a
-python --version
+1. The overall feed is alive but specific symbols have stopped updating.
+2. Check if the symbol is illiquid (normal behavior during low-activity periods).
+3. Check if the symbol is in a trading halt.
 
-# Process info
-ps aux | grep main.py
-netstat -an | grep 8883
+**Actions:**
 
-# Metrics snapshot
-curl http://localhost:8000/metrics > metrics_snapshot.txt
-```
-
-3. **Create issue**:
-- GitHub: https://github.com/lumduan/settrade-feed-adapter/issues
-- Include: logs, metrics, reproduction steps
-
-4. **Contact Settrade support**:
-- Email: support@settrade.com
-- Phone: (Thailand number)
+- **If illiquid:** Add the symbol to `per_symbol_max_gap` with a longer
+  threshold.
+- **If unexpected:** Verify the symbol is subscribed via
+  `adapter.subscribed_symbols`.
+- **If trading halt:** Accept as normal behavior; the symbol will recover when
+  trading resumes.
 
 ---
 
-## Implementation Reference
+## Related Pages
 
-See:
-- [tests/](../../tests/) — Failure scenario tests
-- [examples/](../../examples/) — Working examples
-- [docs/08_testing_and_guarantees/failure_scenarios.md](../08_testing_and_guarantees/failure_scenarios.md) — Known failure modes
-
----
-
-## Next Steps
-
-- **[Deployment Checklist](./deployment_checklist.md)** — Pre-deployment verification
-- **[Tuning Guide](./tuning_guide.md)** — Performance optimization
-- **[Failure Scenarios](../08_testing_and_guarantees/failure_scenarios.md)** — Test coverage
+- [Deployment Checklist](./deployment_checklist.md) -- initial setup verification
+- [Tuning Guide](./tuning_guide.md) -- parameter optimization
+- [Failure Scenarios](../08_testing_and_guarantees/failure_scenarios.md) -- how errors are handled internally
+- [Logging Policy](../07_observability/logging_policy.md) -- understanding log output

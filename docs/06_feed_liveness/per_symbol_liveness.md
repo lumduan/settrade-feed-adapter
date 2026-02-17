@@ -1,338 +1,276 @@
 # Per-Symbol Liveness
 
-Symbol-level feed health monitoring.
+Detecting when individual symbols stop receiving updates.
+
+Source: `core/feed_health.py` -- `FeedHealthMonitor.is_stale()`, `stale_symbols()`
 
 ---
 
 ## Overview
 
-**Per-symbol liveness** tracks whether a **specific symbol** is receiving data.
-
-**Purpose**: Detect when individual symbols stop updating (gap detection).
-
----
-
-## Per-Symbol Liveness Model
-
-### Definition
-
-**Per-symbol liveness** = Has **this symbol** received an event within its timeout?
-
-**Timeout**: Configurable duration (default: 10 seconds)
-
-**Status** (per symbol):
-- ✅ **ALIVE**: Symbol received event within timeout
-- ❌ **STALE**: Symbol has not received event for > timeout
-- ❓ **UNKNOWN**: Symbol never seen (no baseline)
+Per-symbol liveness tracks whether a **specific symbol** has received data
+within its configured threshold. This complements global liveness by detecting
+cases where the overall feed is alive but a particular symbol has gone silent
+(exchange halt, subscription issue, illiquid instrument).
 
 ---
 
-## is_symbol_alive(symbol) → bool
-
-**Contract**: Returns `True` if symbol received event within `symbol_timeout`.
+## is_stale(symbol)
 
 ```python
-from core.feed_health import FeedHealth
-
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-# Record events
-feed_health.record_event("AOT")  # t=0
-time.sleep(5)
-feed_health.record_event("PTT")  # t=5
-
-# Check per-symbol liveness
-assert feed_health.is_symbol_alive("AOT")  # ✅ Recent (5 sec ago)
-assert feed_health.is_symbol_alive("PTT")  # ✅ Recent (0 sec ago)
-assert not feed_health.is_symbol_alive("UNKNOWN")  # ❌ Never seen
+def is_stale(self, symbol: str, now_ns: int | None = None) -> bool
 ```
 
-**Test**: `test_feed_health.py::test_is_symbol_alive_returns_true_when_recent`
+Returns `True` if the symbol was previously seen and its gap exceeds the
+threshold. Returns `False` in two cases:
 
----
-
-## Symbol Timeout Configuration
-
-### symbol_timeout_sec
-
-**Definition**: Maximum time (seconds) without events for **specific symbol** before considered stale.
-
-**Default**: 10.0 seconds
-
-**Recommendation**:
-- **Liquid symbols** (AOT, PTT, CPALL): 5-10 seconds
-- **Illiquid symbols**: 30-60 seconds
-- **After-hours**: 120+ seconds
+1. The symbol has never been seen (use `has_seen()` to distinguish).
+2. The symbol was seen recently (gap within threshold).
 
 ```python
-# Liquid symbols
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
+from core.feed_health import FeedHealthMonitor, FeedHealthConfig
 
-# Illiquid symbols
-feed_health = FeedHealth(symbol_timeout_sec=60.0)
-```
-
----
-
-## Per-Symbol Liveness Semantics
-
-### Independent tracking
-
-**Contract**: Each symbol has independent timeout.
-
-```python
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-feed_health.record_event("AOT")  # t=0
-time.sleep(5)
-feed_health.record_event("PTT")  # t=5
-time.sleep(6)  # Now t=11
-
-# At t=11
-assert not feed_health.is_symbol_alive("AOT")  # ❌ Stale (11 sec ago)
-assert feed_health.is_symbol_alive("PTT")      # ✅ Recent (6 sec ago)
-```
-
-**Test**: `test_feed_health.py::test_is_symbol_alive_independent`
-
----
-
-### Unknown symbols
-
-**Contract**: Unknown symbols (never seen) return `False`.
-
-```python
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-# Never recorded this symbol
-assert not feed_health.is_symbol_alive("UNKNOWN")  # ❌ Unknown
-```
-
-**Test**: `test_feed_health.py::test_is_symbol_alive_unknown_symbol`
-
----
-
-### First observation
-
-**Contract**: Symbol becomes alive immediately after first event.
-
-```python
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-# First event for symbol
-feed_health.record_event("AOT")
-
-# Immediately alive
-assert feed_health.is_symbol_alive("AOT")  # ✅ Just recorded
-```
-
----
-
-## Monitoring Per-Symbol Liveness
-
-### Check All Tracked Symbols
-
-```python
-from core.feed_health import FeedHealth
-
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-def check_all_symbols(symbols: list[str]):
-    stale_symbols = []
-    
-    for symbol in symbols:
-        if not feed_health.is_symbol_alive(symbol):
-            stale_symbols.append(symbol)
-    
-    if stale_symbols:
-        print(f"🚨 Stale symbols: {stale_symbols}")
-    
-    return stale_symbols
-```
-
----
-
-### Alert on Stale Symbol
-
-```python
-import time
-
-def monitor_symbol_liveness(symbols: list[str], feed_health: FeedHealth):
-    while True:
-        for symbol in symbols:
-            if not feed_health.is_symbol_alive(symbol):
-                print(f"⚠️ Symbol stale: {symbol}")
-                # Send alert, log, etc.
-        
-        time.sleep(1.0)  # Check every second
-```
-
----
-
-### Prometheus Metrics
-
-```python
-from prometheus_client import Gauge
-
-symbol_alive_gauge = Gauge(
-    'feed_symbol_alive',
-    'Symbol liveness (1=alive, 0=stale)',
-    ['symbol']
+monitor = FeedHealthMonitor(
+    config=FeedHealthConfig(max_gap_seconds=5.0),
 )
+base_ns = 1_000_000_000_000
+monitor.on_event("PTT", now_ns=base_ns)
 
-# Update metrics
-for symbol in tracked_symbols:
-    is_alive = feed_health.is_symbol_alive(symbol)
-    symbol_alive_gauge.labels(symbol=symbol).set(1 if is_alive else 0)
+# Within threshold
+monitor.is_stale("PTT", now_ns=base_ns + 1_000_000_000)   # False
+
+# Beyond threshold
+monitor.is_stale("PTT", now_ns=base_ns + 6_000_000_000)   # True
+
+# Never seen
+monitor.is_stale("UNKNOWN")                                 # False
 ```
 
-**Alert**:
-```yaml
-- alert: SymbolStale
-  expr: feed_symbol_alive{symbol=~"AOT|PTT|CPALL"} == 0
-  for: 1m
-  labels:
-    severity: warning
-  annotations:
-    summary: "Symbol {{ $labels.symbol }} is stale"
-    description: "No events for > symbol_timeout"
-```
+The comparison uses strictly greater than (`>`), consistent with
+`is_feed_dead()`. A gap exactly equal to the threshold is not considered stale.
 
 ---
 
-## Use Cases
-
-### Gap Detection
-
-**Pattern**: Detect when expected symbols stop updating.
+## has_seen(symbol)
 
 ```python
-from core.feed_health import FeedHealth
-
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-# Tracked symbols (watchlist)
-WATCHLIST = ["AOT", "PTT", "CPALL", "KBANK", "SCB"]
-
-def detect_gaps():
-    gaps = []
-    for symbol in WATCHLIST:
-        if not feed_health.is_symbol_alive(symbol):
-            gaps.append(symbol)
-    
-    if gaps:
-        print(f"Gap detected: {gaps}")
-        # Log, alert, or resubscribe
-    
-    return gaps
+def has_seen(self, symbol: str) -> bool
 ```
 
----
-
-### Selective Resubscription
-
-**Pattern**: Resubscribe only stale symbols.
+Returns `True` if at least one event for the symbol has been recorded via
+`on_event()`. Use this to distinguish "never tracked" from "healthy" when
+`is_stale()` returns `False`.
 
 ```python
-from infra.settrade_mqtt import SettradeMQTTClient
-from core.feed_health import FeedHealth
+monitor = FeedHealthMonitor()
 
-client = SettradeMQTTClient(...)
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-def resubscribe_stale_symbols(symbols: list[str]):
-    stale = [s for s in symbols if not feed_health.is_symbol_alive(s)]
-    
-    if stale:
-        print(f"Resubscribing: {stale}")
-        for symbol in stale:
-            client.subscribe_to_symbol(symbol)
+monitor.has_seen("PTT")       # False
+monitor.on_event("PTT")
+monitor.has_seen("PTT")       # True
 ```
+
+Test: `test_feed_health.py::TestStartupState::test_has_seen_false_for_never_seen`
 
 ---
 
-### Strategy Symbol Filter
+## Per-Symbol Gap Override
 
-**Pattern**: Only process events from alive symbols.
+Different symbols have different activity patterns. Liquid SET equities like
+AOT or PTT update many times per second, while illiquid instruments may go
+minutes without a quote. The `per_symbol_max_gap` dictionary configures
+symbol-specific staleness thresholds.
 
 ```python
-from core.feed_health import FeedHealth
+from core.feed_health import FeedHealthMonitor, FeedHealthConfig
 
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
+monitor = FeedHealthMonitor(
+    config=FeedHealthConfig(
+        max_gap_seconds=5.0,
+        per_symbol_max_gap={"RARE": 60.0, "ILLIQUID": 30.0},
+    ),
+)
+base_ns = 1_000_000_000_000
+monitor.on_event("RARE", now_ns=base_ns)
+monitor.on_event("PTT", now_ns=base_ns)
 
-def strategy_loop():
-    for event in dispatcher.poll():
-        feed_health.record_event(event.symbol)
-        
-        # Skip stale symbols
-        if not feed_health.is_symbol_alive(event.symbol):
-            print(f"Skipping stale symbol: {event.symbol}")
-            continue
-        
-        process_event(event)
+check_ns = base_ns + 10_000_000_000   # 10 seconds later
+
+monitor.is_stale("PTT", now_ns=check_ns)    # True  (10s > 5s global)
+monitor.is_stale("RARE", now_ns=check_ns)   # False (10s < 60s override)
 ```
 
----
+Symbols not in the override dictionary use the global `max_gap_seconds`.
 
-## Global vs Per-Symbol Liveness
-
-| Aspect | Global Liveness | Per-Symbol Liveness |
-|--------|----------------|---------------------|
-| **Scope** | Entire feed | Individual symbol |
-| **Timeout** | `global_timeout_sec` | `symbol_timeout_sec` |
-| **Check** | `is_alive()` | `is_symbol_alive(symbol)` |
-| **Use** | Detect connection issues | Detect symbol-specific gaps |
-| **Typical timeout** | 5-10 sec | 10-60 sec |
-
-**Why different timeouts?**
-- Global: Short timeout to detect connection issues quickly
-- Per-symbol: Longer timeout to account for illiquid symbols
+Test: `test_feed_health.py::TestPerSymbolLiveness::test_per_symbol_gap_override`
 
 ---
 
-## get_stale_symbols() → list[str]
-
-**Contract**: Returns list of symbols that are currently stale.
+## stale_symbols()
 
 ```python
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-feed_health.record_event("AOT")  # t=0
-feed_health.record_event("PTT")  # t=0
-time.sleep(11)  # Wait > timeout
-
-# Both symbols now stale
-stale = feed_health.get_stale_symbols()
-assert set(stale) == {"AOT", "PTT"}
+def stale_symbols(self, now_ns: int | None = None) -> list[str]
 ```
 
-**Test**: `test_feed_health.py::test_get_stale_symbols`
+Returns a list of all currently tracked symbols whose gap exceeds their
+threshold. Cost is O(N) where N is the number of tracked symbols.
+
+```python
+monitor = FeedHealthMonitor(
+    config=FeedHealthConfig(max_gap_seconds=5.0),
+)
+base_ns = 1_000_000_000_000
+monitor.on_event("PTT", now_ns=base_ns)
+monitor.on_event("AOT", now_ns=base_ns + 4_000_000_000)
+
+# At base + 6s: PTT stale (6s > 5s), AOT alive (2s < 5s)
+monitor.stale_symbols(now_ns=base_ns + 6_000_000_000)   # ["PTT"]
+```
+
+Returns an empty list when all tracked symbols are fresh.
+
+Test: `test_feed_health.py::TestPerSymbolLiveness::test_stale_symbols_returns_stale_only`
 
 ---
 
-## Implementation Reference
+## purge(symbol)
 
-See [core/feed_health.py](../../core/feed_health.py):
-- `is_symbol_alive(symbol)` method
-- `get_stale_symbols()` method
-- `symbol_timeout_sec` configuration
-- Per-symbol timestamp tracking
+```python
+def purge(self, symbol: str) -> bool
+```
+
+Removes tracking state for a single symbol. Returns `True` if the symbol was
+tracked and removed, `False` if it was never tracked.
+
+**Does not affect global feed liveness.** After purging, `has_ever_received()`
+still returns `True` if any event was ever recorded.
+
+```python
+monitor = FeedHealthMonitor()
+monitor.on_event("PTT", now_ns=1_000_000_000)
+
+monitor.purge("PTT")              # True
+monitor.has_seen("PTT")           # False
+monitor.has_ever_received()       # True (global unaffected)
+
+monitor.purge("UNKNOWN")          # False (was never tracked)
+```
+
+Use `purge()` when a symbol is unsubscribed or a derivatives contract expires.
+
+Test: `test_feed_health.py::TestLifecycleManagement::test_purge_does_not_affect_global`
+
+---
+
+## reset()
+
+```python
+def reset(self) -> None
+```
+
+Clears all tracking state -- both global and per-symbol. Returns the monitor
+to startup state: `is_feed_dead()` returns `False`, `has_ever_received()`
+returns `False`, all per-symbol data is cleared.
+
+```python
+monitor = FeedHealthMonitor()
+monitor.on_event("PTT", now_ns=1_000_000_000)
+monitor.on_event("AOT", now_ns=2_000_000_000)
+
+monitor.reset()
+
+monitor.has_ever_received()       # False
+monitor.has_seen("PTT")           # False
+monitor.has_seen("AOT")           # False
+monitor.tracked_symbol_count()    # 0
+monitor.is_feed_dead()            # False
+```
+
+Use `reset()` during full reconnection or trading session boundaries.
+
+Test: `test_feed_health.py::TestLifecycleManagement::test_reset_clears_all_state`
+
+---
+
+## tracked_symbol_count()
+
+```python
+def tracked_symbol_count(self) -> int
+```
+
+Returns the number of distinct symbols currently tracked. Duplicate
+`on_event()` calls for the same symbol do not increase the count.
+
+```python
+monitor = FeedHealthMonitor()
+monitor.on_event("PTT", now_ns=1_000_000_000)
+monitor.on_event("AOT", now_ns=2_000_000_000)
+monitor.on_event("PTT", now_ns=3_000_000_000)   # duplicate
+
+monitor.tracked_symbol_count()   # 2
+```
+
+Test: `test_feed_health.py::TestLifecycleManagement::test_tracked_symbol_count`
+
+---
+
+## Memory Model
+
+The per-symbol dictionary grows with the symbol universe and is **never
+automatically evicted**. This is intentional for a fixed subscription model
+(SET equities). For dynamic symbol universes (e.g., derivatives rolling
+contracts), call `purge()` to remove unsubscribed symbols or `reset()` to
+clear all state.
+
+---
+
+## Independent Symbol Tracking
+
+Each symbol has independent staleness tracking. One symbol going stale does
+not affect another. The global feed can be alive (recent events from some
+symbols) even when individual symbols are stale.
+
+```python
+monitor = FeedHealthMonitor(
+    config=FeedHealthConfig(max_gap_seconds=5.0),
+)
+base_ns = 1_000_000_000_000
+monitor.on_event("PTT", now_ns=base_ns)
+monitor.on_event("AOT", now_ns=base_ns + 3_000_000_000)
+
+check_ns = base_ns + 6_000_000_000
+monitor.is_stale("PTT", now_ns=check_ns)      # True  (6s > 5s)
+monitor.is_feed_dead(now_ns=check_ns)          # False (AOT was 3s ago)
+```
+
+Test: `test_feed_health.py::TestMultipleSymbols::test_global_tracks_most_recent`
 
 ---
 
 ## Test Coverage
 
-Key tests in `test_feed_health.py`:
-- `test_is_symbol_alive_returns_true_when_recent` — Alive when recent
-- `test_is_symbol_alive_returns_false_when_stale` — Stale detection
-- `test_is_symbol_alive_independent` — Independent tracking
-- `test_is_symbol_alive_unknown_symbol` — Unknown symbols
-- `test_get_stale_symbols` — Stale symbol list
+Tests in `tests/test_feed_health.py`:
+
+- `TestStartupState::test_is_stale_false_for_never_seen`
+- `TestStartupState::test_has_seen_false_for_never_seen`
+- `TestStartupState::test_has_seen_true_after_event`
+- `TestStartupState::test_tracked_symbol_count_zero_initially`
+- `TestPerSymbolLiveness::test_not_stale_within_gap`
+- `TestPerSymbolLiveness::test_stale_beyond_gap`
+- `TestPerSymbolLiveness::test_per_symbol_gap_override`
+- `TestPerSymbolLiveness::test_stale_symbols_returns_stale_only`
+- `TestPerSymbolLiveness::test_stale_symbols_empty_when_all_fresh`
+- `TestPerSymbolLiveness::test_negative_delta_clamped_per_symbol`
+- `TestLifecycleManagement::test_purge_removes_symbol`
+- `TestLifecycleManagement::test_purge_returns_false_for_unknown`
+- `TestLifecycleManagement::test_purge_does_not_affect_global`
+- `TestLifecycleManagement::test_reset_clears_all_state`
+- `TestLifecycleManagement::test_tracked_symbol_count`
+- `TestMultipleSymbols::test_independent_symbol_tracking`
+- `TestMultipleSymbols::test_global_tracks_most_recent`
 
 ---
 
-## Next Steps
+## Related Pages
 
-- **[Global Liveness](./global_liveness.md)** — System-wide tracking
-- **[Gap Semantics](./gap_semantics.md)** — Message gap detection
-- **[Failure Scenarios](../08_testing_and_guarantees/failure_scenarios.md)** — Gap scenarios
+- [Global Liveness](./global_liveness.md) -- system-wide feed dead detection
+- [Gap Semantics](./gap_semantics.md) -- time units, conversion, and measurement

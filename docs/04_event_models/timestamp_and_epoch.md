@@ -1,272 +1,193 @@
 # Timestamp and Epoch
 
-Understanding timing fields and reconnect tracking in event models.
+Every event carries two timestamps and a connection epoch. This page
+explains their semantics and correct usage.
 
 ---
 
-## Timestamp Fields
+## Dual Timestamps
 
-Every event includes **two timestamps** for different purposes:
+Both `BestBidAsk` and `FullBidOffer` include two timestamp fields,
+captured at the moment the MQTT message is received by the adapter:
 
-### recv_ts: int
-**Wall clock timestamp** (nanoseconds since Unix epoch).
+| Field | Source | Purpose |
+| --- | --- | --- |
+| `recv_ts` | `time.time_ns()` | Wall-clock time for external correlation |
+| `recv_mono_ns` | `time.perf_counter_ns()` | Monotonic time for latency measurement |
 
-**Source**: `time.time_ns()` at MQTT message receipt
+Both fields are non-negative integers (`ge=0`). Negative values are
+rejected during validated construction.
 
-**Purpose**:
-- Correlation with external logs
+---
+
+## recv_ts -- Wall-Clock Timestamp
+
+`recv_ts` records nanoseconds since the Unix epoch using `time.time_ns()`.
+
+**Use for:**
+
+- Correlating with exchange timestamps or external log files
+- Converting to human-readable datetime
 - Absolute time reference
-- Exchange timestamp comparison
 
-**Characteristics**:
-- ✅ Human-readable (can convert to datetime)
-- ✅ Synchronized across machines (via NTP)
-- ⚠️ Subject to NTP adjustment (may jump backwards)
-- ⚠️ Not monotonic
+**Do NOT use for latency measurement.** The wall clock is synchronized
+via NTP and can jump forward or backward when the system clock is
+adjusted. Two consecutive `recv_ts` values may differ by a negative
+amount after an NTP correction:
 
-**Example**:
 ```python
-import time
-from datetime import datetime
+# WRONG -- latency can be negative after NTP adjustment
+latency = event_b.recv_ts - event_a.recv_ts
+```
 
-recv_ts = event.recv_ts  # e.g., 1739500000123456789
+**Converting to datetime:**
 
-# Convert to seconds
-ts_sec = recv_ts / 1e9
+```python
+from datetime import datetime, timezone
 
-# Convert to datetime
-dt = datetime.fromtimestamp(ts_sec)
-print(dt)  # 2025-02-14 14:13:20.123456
+ts_seconds = event.recv_ts / 1_000_000_000
+dt = datetime.fromtimestamp(ts_seconds, tz=timezone.utc)
 ```
 
 ---
 
-### recv_mono_ns: int
-**Monotonic timestamp** (nanoseconds).
+## recv_mono_ns -- Monotonic Timestamp
 
-**Source**: `time.perf_counter_ns()` at MQTT message receipt
+`recv_mono_ns` records nanoseconds from an arbitrary origin using
+`time.perf_counter_ns()`.
 
-**Purpose**:
-- Latency measurement
-- Elapsed time calculation
+**Use for:**
+
+- Measuring processing latency (time from event receipt to action)
+- Computing elapsed time between events
 - Performance profiling
 
-**Characteristics**:
-- ✅ Never goes backwards
-- ✅ High resolution (~1 microsecond)
-- ✅ Immune to NTP adjustment
-- ⚠️ Not human-readable
-- ⚠️ Cannot compare across processes
+**Guarantees:**
 
-**Example**:
+- Never goes backwards, even across NTP adjustments
+- High resolution (sub-microsecond on most platforms)
+- Immune to wall-clock corrections
+
+**Not suitable for:**
+
+- Human-readable time display (the origin is arbitrary)
+- Cross-process comparison (each process has its own monotonic origin)
+
+**Measuring processing latency:**
+
 ```python
-# Measure processing latency
-start_mono = event.recv_mono_ns
-process_event(event)
-end_mono = time.perf_counter_ns()
+import time
 
-latency_ns = end_mono - start_mono
-latency_us = latency_ns / 1000
-print(f"Processing latency: {latency_us:.2f} µs")
+def on_event(event):
+    # ... process the event ...
+    now = time.perf_counter_ns()
+    latency_us = (now - event.recv_mono_ns) / 1_000
+    print(f"Processing latency: {latency_us:.1f} us")
 ```
 
 ---
 
 ## When to Use Which Timestamp
 
-| Use Case | Use recv_ts | Use recv_mono_ns |
-|----------|-------------|------------------|
-| Log correlation | ✅ | ❌ |
-| Human-readable time | ✅ | ❌ |
-| Latency measurement | ❌ | ✅ |
-| Elapsed time | ❌ | ✅ |
-| Performance profiling | ❌ | ✅ |
-| Compare with exchange timestamps | ✅ | ❌ |
-| Detect clock skew | ⚠️ (problematic) | ✅ |
+| Use case | recv_ts | recv_mono_ns |
+| --- | --- | --- |
+| Log correlation | Yes | No |
+| Human-readable time | Yes | No |
+| Compare with exchange time | Yes | No |
+| Latency measurement | No -- NTP can cause jumps | Yes |
+| Elapsed time between events | No | Yes |
+| Performance profiling | No | Yes |
+
+The rule is straightforward: use `recv_ts` to answer "when did this
+happen?" and `recv_mono_ns` to answer "how long did this take?"
 
 ---
 
-## Connection Epoch
+## Validation
 
-### connection_epoch: int
-**Reconnect counter** (increments on each MQTT reconnect).
-
-**Initial value**: `0` (first connection)
-
-**Increment**: Incremented by `+1` after each reconnect
-
-**Purpose**:
-- Detect when strategy needs to reset state
-- Identify events from different connection sessions
-- Debug reconnect-related issues
-
----
-
-## Reconnect Detection Pattern
-
-**Problem**: After reconnect, strategy state may be stale.
-
-**Solution**: Track `connection_epoch` to detect reconnects.
+Both timestamps must be non-negative. Negative values are rejected
+during regular construction:
 
 ```python
-from core.dispatcher import Dispatcher
+BestBidAsk(..., recv_ts=-1, ...)         # raises ValidationError
+BestBidAsk(..., recv_mono_ns=-1, ...)    # raises ValidationError
+```
 
-dispatcher = Dispatcher(maxsize=10000)
-last_epoch = None
+Large values are accepted without issue. A nanosecond timestamp for
+the year 2100 fits comfortably in a Python `int`:
 
-for event in dispatcher.poll():
-    if last_epoch is None:
-        last_epoch = event.connection_epoch
-    
+```python
+BestBidAsk(..., recv_ts=4_102_444_800_000_000_000, ...)   # valid
+```
+
+---
+
+## connection_epoch
+
+The `connection_epoch` field tracks MQTT connection sessions.
+
+| Property | Value |
+| --- | --- |
+| Type | `int` |
+| Default | `0` |
+| Constraint | `ge=0` (negative rejected) |
+| Initial connection | `0` |
+| After reconnect | incremented by the adapter |
+
+### Semantics
+
+- **Epoch 0** is the initial connection established at startup.
+- When the MQTT connection drops and the adapter reconnects, it
+  increments the epoch and replays subscriptions. All events from the
+  new connection carry the new epoch value.
+- The epoch never decreases within a single adapter process lifetime.
+
+### Detecting Reconnects in Strategy Code
+
+A strategy can detect that a reconnect occurred by comparing the
+event's epoch against the last seen epoch:
+
+```python
+last_epoch = 0
+
+def on_event(event):
+    global last_epoch
     if event.connection_epoch != last_epoch:
-        print(f"🔄 Reconnect detected! Epoch changed: {last_epoch} → {event.connection_epoch}")
-        
-        # Reset strategy state
-        clear_position_tracking()
-        clear_cached_market_data()
-        
+        # Reconnect detected -- new connection session
+        clear_cached_book()
+        cancel_pending_orders()
         last_epoch = event.connection_epoch
-    
-    # Process event normally
-    process_event(event)
+    process(event)
 ```
 
----
+### Why Reconnects Matter
 
-## Epoch Semantics
+After a reconnect, the adapter replays subscriptions and begins
+receiving data on a fresh MQTT session. Strategy code should treat
+a new epoch as a signal to:
 
-### All events from same connection have same epoch
+- Clear any cached market data (order books, last-trade state)
+- Invalidate derived calculations that depend on continuity
+- Re-evaluate open positions against fresh data
 
-**Contract**: Within a single MQTT connection session, all events have the same `connection_epoch`.
+Failing to reset state on reconnect can cause a strategy to act on
+stale prices from the previous connection session.
+
+### Negative Epoch Rejected
+
+A negative `connection_epoch` is rejected during validated construction:
 
 ```python
-# First connection (epoch=0)
-event1 = BestBidAsk(..., connection_epoch=0)
-event2 = BestBidAsk(..., connection_epoch=0)
-event3 = BestBidAsk(..., connection_epoch=0)
-
-# Reconnect occurs
-# New connection (epoch=1)
-event4 = BestBidAsk(..., connection_epoch=1)
-event5 = BestBidAsk(..., connection_epoch=1)
+BestBidAsk(..., connection_epoch=-1)   # raises ValidationError
 ```
 
-**Test**: `test_settrade_adapter.py::test_connection_epoch_tracked`
+With `model_construct()`, no validation runs, so the adapter must ensure
+it never passes a negative value.
 
 ---
 
-### Epoch survives reconnect
+## Related Pages
 
-**Contract**: After reconnect, new events have incremented epoch.
-
-```python
-# Before reconnect
-assert all(e.connection_epoch == 0 for e in old_events)
-
-# After reconnect
-assert all(e.connection_epoch == 1 for e in new_events)
-```
-
-**Test**: `test_settrade_adapter.py::test_connection_epoch_increments_on_reconnect`
-
----
-
-## Why Two Timestamps?
-
-### Historical Context
-
-Early implementations used only `recv_ts` (wall clock).
-
-**Problem discovered**: NTP adjustments caused latency measurements to be negative:
-```python
-latency = event2.recv_ts - event1.recv_ts
-# Could be negative if NTP adjusted clock backwards!
-```
-
-**Solution**: Add `recv_mono_ns` for latency measurement.
-
----
-
-### CPython Implementation Notes
-
-**recv_ts** → `time.time_ns()`:
-- System clock
-- Calls `clock_gettime(CLOCK_REALTIME)`
-- Subject to NTP `adjtime()` adjustments
-- **Use for**: Absolute time, logging
-
-**recv_mono_ns** → `time.perf_counter_ns()`:
-- Monotonic clock
-- Calls `clock_gettime(CLOCK_MONOTONIC)`
-- Never goes backwards
-- **Use for**: Intervals, latency
-
----
-
-## Example: Latency Tracking
-
-```python
-import time
-from collections import deque
-
-class LatencyTracker:
-    def __init__(self, window_size: int = 100):
-        self.latencies: deque[int] = deque(maxlen=window_size)
-    
-    def record(self, event):
-        # Measure time from event receipt to processing
-        now_mono = time.perf_counter_ns()
-        latency_ns = now_mono - event.recv_mono_ns
-        self.latencies.append(latency_ns)
-    
-    def get_stats_us(self) -> dict:
-        if not self.latencies:
-            return {}
-        
-        latencies_us = [lat / 1000 for lat in self.latencies]
-        return {
-            "mean": sum(latencies_us) / len(latencies_us),
-            "min": min(latencies_us),
-            "max": max(latencies_us),
-            "p50": sorted(latencies_us)[len(latencies_us) // 2],
-            "p99": sorted(latencies_us)[int(len(latencies_us) * 0.99)],
-        }
-
-# Usage
-tracker = LatencyTracker()
-
-for event in dispatcher.poll():
-    tracker.record(event)
-    process_event(event)
-    
-    if should_print_stats():
-        stats = tracker.get_stats_us()
-        print(f"Latency: mean={stats['mean']:.2f}µs p99={stats['p99']:.2f}µs")
-```
-
----
-
-## Implementation Reference
-
-See:
-- [core/events.py](../../core/events.py) — Event model definitions
-- [infra/settrade_adapter.py](../../infra/settrade_adapter.py) — Timestamp injection
-- [core/dispatcher.py](../../core/dispatcher.py) — Epoch propagation
-
----
-
-## Test Coverage
-
-Key tests:
-- `test_events.py::test_recv_mono_ns_negative_rejected` — Validates monotonic timestamp >= 0
-- `test_settrade_adapter.py::test_recv_ts_and_recv_mono_ns_populated` — Ensures both timestamps set
-- `test_settrade_adapter.py::test_connection_epoch_tracked` — Validates epoch behavior
-- `test_settrade_adapter.py::test_connection_epoch_increments_on_reconnect` — Reconnect tracking
-
----
-
-## Next Steps
-
-- **[BestBidAsk](./best_bid_ask.md)** — Field reference
-- **[Event Contract](./event_contract.md)** — Model specifications
-- **[Global Liveness](../06_feed_liveness/global_liveness.md)** — Feed health tracking
+- [Event Contract](./event_contract.md) -- shared model guarantees
+- [BestBidAsk](./best_bid_ask.md) -- top-of-book field reference
+- [FullBidOffer](./full_bid_offer.md) -- full 10-level depth field reference

@@ -1,100 +1,101 @@
 # settrade-feed-adapter Documentation
 
-> **📚 Comprehensive technical documentation for the settrade-feed-adapter market data ingestion layer**
+Technical documentation for the settrade-feed-adapter market data ingestion
+layer.
 
 ---
 
-## 📖 Documentation Navigation
+## Documentation Navigation
 
-### 🟢 For Newcomers (15-Minute Read)
+### For Newcomers
 
 Start here to understand the system:
 
-1. **[What Is This?](./00_getting_started/what_is_this.md)** — Overview and design guarantees
-2. **[Quickstart Guide](./00_getting_started/quickstart.md)** — Get running in 5 minutes
-3. **[Mental Model](./00_getting_started/mental_model.md)** — Conceptual understanding
+1. [What Is This?](./00_getting_started/what_is_this.md) -- Overview and design guarantees
+2. [Quickstart Guide](./00_getting_started/quickstart.md) -- Get running in 5 minutes
+3. [Mental Model](./00_getting_started/mental_model.md) -- Conceptual understanding
 
-### 🔵 For Experienced Developers
+### For Experienced Developers
 
 Find contracts, invariants, and edge cases:
 
-- **[Event Contract](./04_event_models/event_contract.md)** — Event model specifications
-- **[Normalization Contract](./03_adapter_and_normalization/normalization_contract.md)** — Data transformation rules
-- **[Queue Model](./05_dispatcher_and_backpressure/queue_model.md)** — Dispatcher internals
-- **[Reconnect Strategy](./02_transport_mqtt/reconnect_strategy.md)** — Connection recovery
-- **[Invariants Defined by Tests](./08_testing_and_guarantees/invariants_defined_by_tests.md)** — Design guarantees
+- [Event Contract](./04_event_models/event_contract.md) -- Event model specifications
+- [Normalization Contract](./03_adapter_and_normalization/normalization_contract.md) -- Data transformation rules
+- [Queue Model](./05_dispatcher_and_backpressure/queue_model.md) -- Dispatcher internals
+- [Reconnect Strategy](./02_transport_mqtt/reconnect_strategy.md) -- Connection recovery
+- [Invariants Defined by Tests](./08_testing_and_guarantees/invariants_defined_by_tests.md) -- Design guarantees
 
-### 🔴 For Maintainers
+### For Maintainers
 
 See design guarantees backed by test coverage:
 
-- **[Testing and Guarantees](./08_testing_and_guarantees/)** — 301 test cases, all invariants
-- **[Concurrency Guarantees](./08_testing_and_guarantees/concurrency_guarantees.md)** — Thread safety contracts
-- **[Failure Scenarios](./08_testing_and_guarantees/failure_scenarios.md)** — Error handling coverage
-- **[Performance Targets](./07_observability/performance_targets.md)** — Benchmark methodology
+- [Testing and Guarantees](./08_testing_and_guarantees/) -- 301 test cases, all invariants
+- [Concurrency Guarantees](./08_testing_and_guarantees/concurrency_guarantees.md) -- Thread safety contracts
+- [Failure Scenarios](./08_testing_and_guarantees/failure_scenarios.md) -- Error handling coverage
+- [Performance Targets](./07_observability/performance_targets.md) -- Benchmark methodology
 
 ---
 
-## 📂 Documentation Structure
+## Directory Structure
 
-```
+```text
 docs/
-├── 00_getting_started/          # New user onboarding
-│   ├── what_is_this.md          # Overview (10 min read)
-│   ├── quickstart.md            # Get running (5 min)
-│   └── mental_model.md          # Conceptual understanding (15 min)
+├── 00_getting_started/
+│   ├── what_is_this.md
+│   ├── quickstart.md
+│   └── mental_model.md
 │
-├── 01_system_overview/          # Architecture deep dive
-│   ├── architecture.md          # Component-level design
-│   ├── data_flow.md             # End-to-end message trace
-│   ├── threading_and_concurrency.md  # Concurrency model
-│   └── state_machines.md        # State transition diagrams
+├── 01_system_overview/
+│   ├── architecture.md
+│   ├── data_flow.md
+│   ├── threading_and_concurrency.md
+│   └── state_machines.md
 │
-├── 02_transport_mqtt/           # Phase 1: Transport layer
-│   ├── client_lifecycle.md      # Connection state machine
-│   ├── authentication_and_token.md  # Auth flow
-│   ├── reconnect_strategy.md    # Auto-reconnect logic
-│   └── subscription_model.md    # Topic subscription
+├── 02_transport_mqtt/
+│   ├── client_lifecycle.md
+│   ├── authentication_and_token.md
+│   ├── reconnect_strategy.md
+│   └── subscription_model.md
 │
-├── 03_adapter_and_normalization/  # Phase 2: Parsing
-│   ├── parsing_pipeline.md      #Protobuf → Event flow
-│   ├── normalization_contract.md  # Data transformation rules
-│   ├── money_precision_model.md   # Float precision contract
-│   └── error_isolation_model.md   # Error handling
+├── 03_adapter_and_normalization/
+│   ├── parsing_pipeline.md
+│   ├── normalization_contract.md
+│   ├── money_precision_model.md
+│   └── error_isolation_model.md
 │
-├── 04_event_models/             # Event contracts
-│   ├── event_contract.md        # Model specifications
-│   ├── best_bid_ask.md          # BestBidAsk fields
-│   ├── full_bid_offer.md        # FullBidOffer fields
-│   └── timestamp_and_epoch.md   # Timestamp semantics
+├── 04_event_models/
+│   ├── event_contract.md
+│   ├── best_bid_ask.md
+│   ├── full_bid_offer.md
+│   └── timestamp_and_epoch.md
 │
-├── 05_dispatcher_and_backpressure/  # Phase 3: Queuing
-│   ├── queue_model.md           # Deque internals
-│   ├── overflow_policy.md       # Drop-oldest strategy
-│   └── health_and_ema.md        # EMA drop rate monitoring
+├── 05_dispatcher_and_backpressure/
+│   ├── queue_model.md
+│   ├── overflow_policy.md
+│   └── health_and_ema.md
 │
-├── 06_feed_liveness/            # Phase 5: Health monitoring
-│   ├── global_liveness.md       # Feed death detection
-│   ├── per_symbol_liveness.md   # Per-symbol staleness
-│   └── gap_semantics.md         # Gap threshold behavior
+├── 06_feed_liveness/
+│   ├── global_liveness.md
+│   ├── per_symbol_liveness.md
+│   └── gap_semantics.md
 │
-├── 07_observability/            # Metrics and monitoring
-│   ├── metrics_reference.md     # All metrics documented
-│   ├── logging_policy.md        # Logging standards
-│   ├── benchmark_guide.md       # Benchmark methodology
-│   └── performance_targets.md   # Expected performance
+├── 07_observability/
+│   ├── metrics_reference.md
+│   ├── logging_policy.md
+│   ├── benchmark_guide.md
+│   └── performance_targets.md
 │
-├── 08_testing_and_guarantees/   # Test-backed contracts
-│   ├── invariants_defined_by_tests.md  # Design guarantees
-│   ├── concurrency_guarantees.md       # Thread safety
-│   └── failure_scenarios.md            # Error cases covered
+├── 08_testing_and_guarantees/
+│   ├── invariants_defined_by_tests.md
+│   ├── concurrency_guarantees.md
+│   └── failure_scenarios.md
 │
-├── 09_production_guide/         # Deployment and operations
-│   ├── deployment_checklist.md  # Pre-launch checklist
-│   ├── tuning_guide.md          # Configuration tuning
-│   └── failure_playbook.md      # Troubleshooting guide
+├── 09_production_guide/
+│   ├── deployment_checklist.md
+│   ├── tuning_guide.md
+│   └── failure_playbook.md
 │
-├── glossary.md                  # Terminology reference
+├── glossary.md
 │
 └── plan/                        # Original design docs (archived)
     └── low-latency-mqtt-feed-adapter/
@@ -108,156 +109,108 @@ docs/
 
 ---
 
-## 🎯 Quick Reference
-
-### Common Tasks
+## Quick Reference
 
 | Task | Documentation |
-|------|---------------|
-| **Getting Started** | [Quickstart Guide](./00_getting_started/quickstart.md) |
-| **Understanding Architecture** | [Architecture Overview](./01_system_overview/architecture.md) |
-| **Event Models** | [Event Contract](./04_event_models/event_contract.md) |
-| **Handling Reconnects** | [Reconnect Strategy](./02_transport_mqtt/reconnect_strategy.md) |
-| **Monitoring Feed Health** | [Feed Liveness](./06_feed_liveness/global_liveness.md) |
-| **Performance Tuning** | [Tuning Guide](./09_production_guide/tuning_guide.md) |
-| **Troubleshooting** | [Failure Playbook](./09_production_guide/failure_playbook.md) |
-| **Understanding Tests** | [Invariants](./08_testing_and_guarantees/invariants_defined_by_tests.md) |
+| --- | --- |
+| Getting started | [Quickstart Guide](./00_getting_started/quickstart.md) |
+| Understanding architecture | [Architecture Overview](./01_system_overview/architecture.md) |
+| Event model fields | [Event Contract](./04_event_models/event_contract.md) |
+| Handling reconnects | [Reconnect Strategy](./02_transport_mqtt/reconnect_strategy.md) |
+| Monitoring feed health | [Global Liveness](./06_feed_liveness/global_liveness.md) |
+| All available metrics | [Metrics Reference](./07_observability/metrics_reference.md) |
+| Performance tuning | [Tuning Guide](./09_production_guide/tuning_guide.md) |
+| Troubleshooting | [Failure Playbook](./09_production_guide/failure_playbook.md) |
+| Understanding tests | [Invariants](./08_testing_and_guarantees/invariants_defined_by_tests.md) |
+| Looking up a term | [Glossary](./glossary.md) |
 
 ---
 
-## 📊 Test Coverage
+## Test Coverage Summary
 
-- **Total Test Cases**: 301
-- **Total Test Code**: 4,684 lines
-- **Test Files**: 6
-- **Coverage**: All critical paths and edge cases
+**Total tests:** 301 across 6 test files.
 
-### Test Files
+| Test File | Tests | Coverage Area |
+| --- | --- | --- |
+| `test_benchmark_utils.py` | 46 | Percentile, stats, payloads, config, GC, CPU, aggregation, formatting, JSON |
+| `test_dispatcher.py` | 113 | Config, stats, health, init, push/poll, overflow/drops, clear, invariant, input validation, thread safety, stress, EMA |
+| `test_events.py` | 48 | BidAskFlag, BestBidAsk, FullBidOffer -- frozen, extra rejected, validation, hashable, equality, coercion, auction, epoch |
+| `test_feed_health.py` | 25 | Config, startup state, global liveness, per-symbol, last_seen_gap_ms, lifecycle, multiple symbols |
+| `test_settrade_adapter.py` | 36 | Config, money_to_float, subscription, parsing, error isolation, rate-limited logging, stats, end-to-end |
+| `test_settrade_mqtt.py` | 33 | Config, state machine, subscription, message dispatch, reconnect, token refresh, stats, generation, shutdown |
 
-1. `test_benchmark_utils.py` — Benchmark infrastructure (45 tests)
-2. `test_dispatcher.py` — Phase 3 dispatcher (99 tests)
-3. `test_events.py` — Event models (48 tests)
-4. `test_feed_health.py` — Phase 5 feed monitoring (25 tests)
-5. `test_settrade_adapter.py` — Phase 2 adapter (36 tests)
-6. `test_settrade_mqtt.py` — Phase 1 transport (48 tests)
+Key invariants tested:
 
-### Key Invariants Tested
-
-- ✅ Dispatcher invariant always holds
-- ✅ Concurrent push/poll is safe
-- ✅ Generation prevents stale messages
-- ✅ No duplicate reconnect loops
-- ✅ Reconnect blocked after shutdown
-- ✅ Shutdown is idempotent
-- ✅ Parse errors isolated
-- ✅ Callback errors isolated
-- ✅ Drop count is exact
-- ✅ FIFO ordering preserved
+- Dispatcher accounting invariant: `total_pushed - total_dropped - total_polled == queue_len`
+- Concurrent push/poll is safe (CPython GIL)
+- Generation prevents stale message dispatch
+- No duplicate reconnect loops
+- Shutdown is idempotent
+- Parse errors isolated from callback errors
+- Drop count matches evicted events exactly
+- FIFO ordering preserved
+- EMA decays without drops
 
 ---
 
-## 🚀 Design Principles
+## Design Principles
 
-### 1. Transport Reliability
-- Auto-reconnect with exponential backoff
-- Token refresh before expiration
-- Generation-based stale message rejection
+### Transport Reliability
 
-### 2. Data Correctness
-- Strongly-typed Pydantic models
-- Direct protobuf access (no `.to_dict()`)
-- Comprehensive input validation
+Auto-reconnect with exponential backoff and jitter. Token refresh via
+controlled reconnect before expiry. Generation-based stale message rejection.
 
-### 3. Delivery Control
-- Bounded queue with explicit backpressure
-- Drop-oldest policy (stale data is worthless)
-- Visible overflow metrics
+### Data Correctness
 
-### 4. Error Isolation
-- Errors contained within layers
-- Comprehensive error counting
-- No error propagation across layers
+Strongly-typed frozen Pydantic models (`BestBidAsk`, `FullBidOffer`). Direct
+protobuf field access (no `.to_dict()`). Inline Money conversion
+(`units + nanos * 1e-9`, no `Decimal`). Event construction via
+`model_construct()` in the hot path.
 
-### 5. Observability
-- Zero external dependencies
-- Comprehensive metrics
-- Lock-free stats reads
+### Delivery Control
 
----
+Bounded `deque(maxlen)` queue with drop-oldest backpressure. EMA-smoothed
+drop rate tracking with configurable warning threshold.
 
-## 📈 Performance Characteristics
+### Error Isolation
 
-**Realistic Performance**: ~1.1-1.3x faster than SDK (parse + normalize only)
+Parse errors and callback errors tracked in separate counters. Rate-limited
+logging prevents log storms (first 10 with stack trace, then every 1000th).
+No error propagation across layers.
 
-**Primary Value**: Architectural control and deterministic event flow, not raw speed
+### Observability
 
-### Measured Latencies (Typical)
-
-| Operation | P50 | P95 | P99 |
-|-----------|-----|-----|-----|
-| Parse + Normalize | ~10-15µs | ~20-30µs | ~40-60µs |
-| Queue Wait | Varies | Varies | Varies |
-| End-to-End | ~50-500µs | ~0.5-2ms | ~1-5ms |
-
-*Note: Actual latencies depend on CPU, system load, Python version, and polling frequency.*
+All metrics exposed via `stats()` and `health()` methods. Python stdlib
+logging only. No external monitoring dependencies.
 
 ---
 
-## 🔗 External Resources
+## Source Code Layout
 
-- **Settrade Open API Docs**: https://developer.settrade.com/open-api/
-- **Project Repository**: https://github.com/lumduan/settrade-feed-adapter
-- **Original README**: ../README.md (root-level)
-
----
-
-## 🛠️ Maintenance
-
-### Documentation Updates
-
-When updating documentation:
-1. Follow the existing structure
-2. Update cross-references if files are renamed
-3. Run all tests to ensure accuracy: `uv run pytest tests -v`
-4. Update this README if new sections are added
-
-### Adding New Sections
-
-To add a new documentation section:
-1. Create a folder: `docs/NN_section_name/`
-2. Add markdown files with clear headings
-3. Update this README's structure section
-4. Add cross-references from related docs
+| Path | Description |
+| --- | --- |
+| `core/events.py` | `BestBidAsk`, `FullBidOffer`, `BidAskFlag` event models |
+| `core/dispatcher.py` | Bounded event queue with drop-oldest policy and EMA |
+| `core/feed_health.py` | `FeedHealthMonitor` with global and per-symbol liveness |
+| `infra/settrade_mqtt.py` | `SettradeMQTTClient` MQTT transport with auto-reconnect |
+| `infra/settrade_adapter.py` | `BidOfferAdapter` protobuf parser and normalizer |
+| `scripts/benchmark_utils.py` | Benchmark infrastructure (payloads, percentiles, aggregation) |
+| `scripts/benchmark_adapter.py` | Adapter benchmark script |
+| `scripts/benchmark_compare.py` | SDK vs adapter comparison script |
+| `scripts/benchmark_parallel.py` | Parallel benchmark script |
+| `tests/` | 301 tests across 6 files |
 
 ---
 
-## 📝 Document Versioning
+## Running Tests
 
-**Documentation Version**: 1.0.0  
-**Last Updated**: 2026-02-17  
-**Corresponding Code Version**: Phase 5 Complete
-
----
-
-## 💡 Tips for Reading
-
-- **Start with [What Is This?](./00_getting_started/what_is_this.md)** if you're new
-- **Use the [Glossary](./glossary.md)** for unfamiliar terms
-- **Follow cross-references** (links) for deep dives
-- **Check [Invariants](./08_testing_and_guarantees/invariants_defined_by_tests.md)** to understand guarantees
-- **Reference [Failure Playbook](./09_production_guide/failure_playbook.md)** when troubleshooting
+```bash
+uv run pytest tests -v
+```
 
 ---
 
-## ✨ Key Takeaways
+## Related Resources
 
-1. **Transport Reliability**: Self-healing MQTT connection
-2. **Data Correctness**: Typed, validated events
-3. **Delivery Control**: Explicit backpressure
-4. **Error Isolation**: Errors never propagate
-5. **Observability**: Comprehensive metrics
-6. **Test Coverage**: 301 tests, all invariants covered
-
----
-
-**Happy reading! 📚**
+- [Glossary](./glossary.md) -- terminology reference
+- [Original Design Plans](./plan/low-latency-mqtt-feed-adapter/PLAN.md) -- archived design documents
