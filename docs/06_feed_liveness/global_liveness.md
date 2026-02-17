@@ -1,290 +1,202 @@
-# Global Liveness
+# Global Feed Liveness
 
-System-wide feed health monitoring.
+Detecting whether the entire MQTT feed is alive or dead.
+
+Source: `core/feed_health.py` -- `FeedHealthMonitor.is_feed_dead()`
 
 ---
 
 ## Overview
 
-**Global liveness** tracks whether the **entire feed** is receiving data.
+Global liveness answers one question: **has any event arrived recently?**
 
-**Purpose**: Detect when MQTT connection is broken or silently stalled.
-
----
-
-## FeedHealth Architecture
-
-### Purpose
-
-The `FeedHealth` component provides:
-- ✅ **Global liveness**: Is the feed alive?
-- ✅ **Per-symbol liveness**: Is a specific symbol receiving data?
-- ✅ **Timeout detection**: Configurable stall thresholds
-- ✅ **Gap tracking**: Identify message delivery gaps
-
-See [Phase 5 plan](../../plan/low-latency-mqtt-feed-adapter/phase5-feed-integrity.md) for design rationale.
+The `FeedHealthMonitor` tracks the timestamp of the most recent event across
+all symbols. If the gap between now and that timestamp exceeds
+`max_gap_seconds`, the feed is considered dead.
 
 ---
 
-## Global Liveness Model
+## Startup-Aware Behavior
 
-### Definition
-
-**Global liveness** = Has **any** event been received within the timeout?
-
-**Timeout**: Configurable duration (default: 5 seconds)
-
-**Status**:
-- ✅ **ALIVE**: Event received within timeout
-- ❌ **STALE**: No events received for > timeout
-
----
-
-## is_alive() → bool
-
-**Contract**: Returns `True` if **any** event received within `global_timeout`.
+Before the first event is received, `is_feed_dead()` returns `False`. This is
+intentional -- the monitor cannot distinguish "feed is dead" from "feed has not
+started yet." Use `has_ever_received()` to tell these states apart.
 
 ```python
-from core.feed_health import FeedHealth
+from core.feed_health import FeedHealthMonitor
 
-feed_health = FeedHealth(global_timeout_sec=5.0)
+monitor = FeedHealthMonitor()
 
-# Record events
-feed_health.record_event("AOT")
-feed_health.record_event("PTT")
+# Before any event
+monitor.is_feed_dead()        # False (unknown, not dead)
+monitor.has_ever_received()   # False (no events yet)
 
-# Check global liveness
-if feed_health.is_alive():
-    print("✅ Feed is alive")
-else:
-    print("❌ Feed is stale")
+# After first event
+monitor.on_event("PTT")
+monitor.is_feed_dead()        # False (just received)
+monitor.has_ever_received()   # True
 ```
 
-**Test**: `test_feed_health.py::test_is_alive_returns_true_when_recent`
+**State transitions:**
+
+| `has_ever_received()` | `is_feed_dead()` | Meaning |
+| --- | --- | --- |
+| `False` | `False` | Startup -- no events yet |
+| `True` | `False` | Healthy -- events arriving within threshold |
+| `True` | `True` | Dead -- gap exceeds `max_gap_seconds` |
+
+The combination `has_ever_received() == False` and `is_feed_dead() == True`
+never occurs. Before the first event, `is_feed_dead()` always returns `False`.
 
 ---
 
-## Global Timeout Configuration
+## Feed Dead Detection
 
-### global_timeout_sec
+After the first event, `is_feed_dead()` computes:
 
-**Definition**: Maximum time (seconds) without **any** events before feed considered stale.
+```text
+gap = max(0, now - last_global_event_ns)
+return gap > max_gap_ns
+```
 
-**Default**: 5.0 seconds
-
-**Recommendation**:
-- **Real-time feed** (1-100 msg/sec): 5-10 seconds
-- **Low-volume feed** (< 1 msg/sec): 30-60 seconds
-- **Batch/delayed feed**: 120+ seconds
+The comparison is strictly greater than (`>`). A gap exactly equal to
+`max_gap_seconds` is **not** considered dead.
 
 ```python
-# High-frequency feed
-feed_health = FeedHealth(global_timeout_sec=5.0)
+from core.feed_health import FeedHealthMonitor, FeedHealthConfig
 
-# Low-frequency feed
-feed_health = FeedHealth(global_timeout_sec=30.0)
+monitor = FeedHealthMonitor(
+    config=FeedHealthConfig(max_gap_seconds=5.0),
+)
+base_ns = 1_000_000_000_000
+monitor.on_event("PTT", now_ns=base_ns)
+
+# 1 second later -- alive
+monitor.is_feed_dead(now_ns=base_ns + 1_000_000_000)   # False
+
+# Exactly 5 seconds -- alive (> not >=)
+monitor.is_feed_dead(now_ns=base_ns + 5_000_000_000)   # False
+
+# 6 seconds later -- dead
+monitor.is_feed_dead(now_ns=base_ns + 6_000_000_000)   # True
 ```
+
+Test: `test_feed_health.py::TestGlobalFeedLiveness::test_feed_dead_exactly_at_boundary`
 
 ---
 
-## Global Liveness Semantics
+## Feed Recovery
 
-### Any-symbol liveness
-
-**Contract**: Feed is alive if **any symbol** has recent data.
+The feed recovers as soon as any new event arrives. There is no hysteresis
+or debounce -- a single event immediately brings the feed back to alive.
 
 ```python
-feed_health = FeedHealth(global_timeout_sec=5.0)
+monitor = FeedHealthMonitor(
+    config=FeedHealthConfig(max_gap_seconds=5.0),
+)
+base_ns = 1_000_000_000_000
+monitor.on_event("PTT", now_ns=base_ns)
 
-# Record events for different symbols
-feed_health.record_event("AOT")  # t=0
-time.sleep(3)
-feed_health.record_event("PTT")  # t=3
+dead_ns = base_ns + 6_000_000_000
+assert monitor.is_feed_dead(now_ns=dead_ns) is True
 
-# At t=4
-assert feed_health.is_alive()  # ✅ AOT or PTT recent
+# New event arrives
+monitor.on_event("PTT", now_ns=dead_ns)
+assert monitor.is_feed_dead(now_ns=dead_ns + 100_000) is False
 ```
 
-**Why?**
-- Single active symbol keeps feed alive
-- Prevents false negatives during off-hours
+Test: `test_feed_health.py::TestGlobalFeedLiveness::test_feed_recovers_after_new_event`
 
 ---
 
-### Stale detection
+## Negative Delta Clamping
 
-**Contract**: Feed is stale if **no symbols** have recent data.
+All time computations use `max(0, now - last_ns)` to clamp negative deltas
+to zero. This prevents spurious results if `now_ns` is passed out of order
+during testing.
 
 ```python
-feed_health = FeedHealth(global_timeout_sec=5.0)
+monitor = FeedHealthMonitor()
+monitor.on_event("PTT", now_ns=1_000_000_000)
 
-feed_health.record_event("AOT")  # t=0
-
-time.sleep(6)  # Wait > timeout
-
-# At t=6
-assert not feed_health.is_alive()  # ❌ No recent events
+# now_ns < last event -- clamped to 0, feed is alive
+monitor.is_feed_dead(now_ns=500_000_000)   # False
 ```
 
-**Test**: `test_feed_health.py::test_is_alive_returns_false_when_stale`
+Test: `test_feed_health.py::TestGlobalFeedLiveness::test_negative_delta_clamped`
 
 ---
 
-## Monitoring Global Liveness
+## Configuration
 
-### Periodic Check
+Global liveness uses `FeedHealthConfig.max_gap_seconds`:
 
 ```python
-import time
-from core.feed_health import FeedHealth
+from core.feed_health import FeedHealthConfig
 
-feed_health = FeedHealth(global_timeout_sec=5.0)
-
-def monitor_global_liveness():
-    while True:
-        if not feed_health.is_alive():
-            print("🚨 ALERT: Feed is stale!")
-            # Send alert, restart connection, etc.
-        
-        time.sleep(1.0)  # Check every second
-
-# Run in separate thread
-import threading
-monitor_thread = threading.Thread(target=monitor_global_liveness, daemon=True)
-monitor_thread.start()
+config = FeedHealthConfig(
+    max_gap_seconds=5.0,   # default; must be > 0
+)
 ```
+
+- **Type:** `float`
+- **Default:** `5.0`
+- **Constraint:** `gt=0` (zero and negative values rejected)
+- **Internal conversion:** Multiplied by `1_000_000_000` to nanoseconds at init
+
+The config is a frozen Pydantic model. Mutating fields after construction raises
+`ValidationError`.
 
 ---
 
-### Health Check Endpoint
+## Monotonic Timestamps
+
+All timestamps use `time.perf_counter_ns()` (monotonic clock). This makes
+liveness detection immune to NTP adjustments, leap seconds, and wall-clock
+skew.
+
+The `now_ns` parameter on `is_feed_dead()` and `on_event()` allows injecting
+a pre-captured timestamp for reuse across multiple calls in a single poll
+loop, avoiding redundant `perf_counter_ns()` calls.
+
+---
+
+## Thread Safety
+
+`FeedHealthMonitor` is **NOT thread-safe**. It is designed for use from the
+strategy/consumer thread only, consistent with the SPSC (single-producer,
+single-consumer) pattern of the dispatcher.
+
+---
+
+## has_ever_received()
 
 ```python
-from flask import Flask, jsonify
-from core.feed_health import FeedHealth
-
-app = Flask(__name__)
-feed_health = FeedHealth(global_timeout_sec=5.0)
-
-@app.route("/health/feed")
-def feed_health_check():
-    is_alive = feed_health.is_alive()
-    
-    return jsonify({
-        "is_alive": is_alive,
-        "status": "healthy" if is_alive else "stale",
-    }), 200 if is_alive else 503
-
-# Usage
-# curl http://localhost:5000/health/feed
+def has_ever_received(self) -> bool
 ```
 
----
-
-### Prometheus Metric
-
-```python
-from prometheus_client import Gauge
-
-feed_alive_gauge = Gauge('feed_global_alive', 'Feed global liveness (1=alive, 0=stale)')
-
-# Update metric
-feed_alive_gauge.set(1 if feed_health.is_alive() else 0)
-```
-
-**Alert**:
-```yaml
-- alert: FeedStale
-  expr: feed_global_alive == 0
-  for: 1m
-  labels:
-    severity: critical
-  annotations:
-    summary: "Feed is stale"
-    description: "No events received for > global_timeout"
-```
-
----
-
-## Use Cases
-
-### Reconnect Trigger
-
-**Pattern**: Reconnect MQTT when feed is stale.
-
-```python
-from infra.settrade_mqtt import SettradeMQTTClient
-from core.feed_health import FeedHealth
-
-client = SettradeMQTTClient(...)
-feed_health = FeedHealth(global_timeout_sec=10.0)
-
-def monitor_and_reconnect():
-    while True:
-        if not feed_health.is_alive():
-            print("Feed stale, reconnecting...")
-            client.reconnect()
-        
-        time.sleep(5.0)
-```
-
----
-
-### Strategy State Management
-
-**Pattern**: Reset strategy state when feed is stale.
-
-```python
-from core.feed_health import FeedHealth
-
-feed_health = FeedHealth(global_timeout_sec=5.0)
-
-def strategy_loop():
-    for event in dispatcher.poll():
-        if not feed_health.is_alive():
-            print("Feed stale, resetting state...")
-            reset_positions()
-            reset_cached_data()
-        
-        feed_health.record_event(event.symbol)
-        process_event(event)
-```
-
----
-
-## Global vs Per-Symbol Liveness
-
-| Aspect | Global Liveness | Per-Symbol Liveness |
-|--------|----------------|---------------------|
-| **Scope** | Entire feed | Individual symbol |
-| **Timeout** | `global_timeout_sec` | `symbol_timeout_sec` |
-| **Check** | `is_alive()` | `is_symbol_alive(symbol)` |
-| **Use** | Detect connection issues | Detect symbol-specific gaps |
-
-**See**: [Per-Symbol Liveness](./per_symbol_liveness.md) for symbol-level tracking.
-
----
-
-## Implementation Reference
-
-See [core/feed_health.py](../../core/feed_health.py):
-- `is_alive()` method
-- `global_timeout_sec` configuration
-- Global timestamp tracking
+Returns `True` if at least one event has been recorded via `on_event()`.
+Use this to distinguish startup (unknown) from healthy (events flowing).
 
 ---
 
 ## Test Coverage
 
-Key tests in `test_feed_health.py`:
-- `test_is_alive_returns_true_when_recent` — Alive when recent
-- `test_is_alive_returns_false_when_stale` — Stale detection
-- `test_is_alive_any_symbol` — Any-symbol semantics
-- `test_is_alive_after_clear` — Clear resets state
+Tests in `tests/test_feed_health.py`:
+
+- `TestStartupState::test_is_feed_dead_false_before_first_event`
+- `TestStartupState::test_has_ever_received_false_initially`
+- `TestStartupState::test_has_ever_received_true_after_event`
+- `TestGlobalFeedLiveness::test_feed_alive_within_gap`
+- `TestGlobalFeedLiveness::test_feed_dead_beyond_gap`
+- `TestGlobalFeedLiveness::test_feed_dead_exactly_at_boundary`
+- `TestGlobalFeedLiveness::test_feed_recovers_after_new_event`
+- `TestGlobalFeedLiveness::test_negative_delta_clamped`
 
 ---
 
-## Next Steps
+## Related Pages
 
-- **[Per-Symbol Liveness](./per_symbol_liveness.md)** — Symbol-level tracking
-- **[Gap Semantics](./gap_semantics.md)** — Message gap detection
-- **[Failure Scenarios](../08_testing_and_guarantees/failure_scenarios.md)** — Stall scenarios
+- [Per-Symbol Liveness](./per_symbol_liveness.md) -- symbol-level staleness
+- [Gap Semantics](./gap_semantics.md) -- time unit conversion and gap measurement
+- [Failure Scenarios](../08_testing_and_guarantees/failure_scenarios.md) -- feed silence handling

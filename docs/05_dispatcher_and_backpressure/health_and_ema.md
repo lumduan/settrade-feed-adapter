@@ -1,352 +1,149 @@
-# Health and EMA
+# Health Monitoring and EMA Drop-Rate Tracking
 
-Queue health monitoring using exponential moving averages.
+The Dispatcher exposes a `health()` method that returns a frozen Pydantic model
+with real-time backpressure indicators. The centrepiece is an exponential moving
+average (EMA) of the drop rate, which smooths out transient spikes and provides
+a stable signal for alerting.
 
----
+## DispatcherHealth Model
 
-## Overview
-
-The Dispatcher tracks **queue health** using:
-- Current queue depth
-- Overflow count
-- Exponential moving average (EMA) of message rate
-
-**Purpose**: Detect consumer performance degradation before overflow occurs.
-
----
-
-## Health Metrics
-
-### get_health() → dict
-
-**Contract**: Returns dictionary with current health metrics.
+`health()` returns a frozen, immutable Pydantic model -- not a dict:
 
 ```python
-health = dispatcher.get_health()
-
-print(health)
-# {
-#     "queue_depth": 1234,
-#     "maxsize": 10000,
-#     "fill_ratio": 0.1234,
-#     "overflow_count": 0,
-#     "is_healthy": True,
-# }
+class DispatcherHealth(BaseModel, frozen=True, extra="forbid"):
+    drop_rate_ema: float       # ge=0.0  -- 0.0 = no drops, 1.0 = every push drops
+    queue_utilization: float   # ge=0.0, le=1.0
+    total_dropped: int         # ge=0
+    total_pushed: int          # ge=0
 ```
 
-**Test**: `test_dispatcher.py::test_get_health_returns_metrics`
-
----
-
-### queue_depth
-
-**Definition**: Number of events currently in queue.
-
-**Source**: `dispatcher._queue.qsize()`
-
-**Range**: [0, maxsize]
-
----
-
-### maxsize
-
-**Definition**: Maximum queue capacity.
-
-**Source**: `dispatcher._maxsize`
-
-**Configured at**: Dispatcher initialization
-
----
-
-### fill_ratio
-
-**Definition**: Current depth as fraction of capacity.
-
-**Formula**: `queue_depth / maxsize`
-
-**Range**: [0.0, 1.0]
-
-**Healthy**: < 0.5
-
-**Warning**: 0.5 - 0.8
-
-**Critical**: > 0.8
-
----
-
-### overflow_count
-
-**Definition**: Total number of events dropped due to queue full.
-
-**Source**: `dispatcher._overflow_count`
-
-**Range**: [0, ∞)
-
-**Healthy**: 0
-
-**Warning**: > 0 (investigate consumer)
-
----
-
-### is_healthy
-
-**Definition**: Boolean indicating overall health status.
-
-**Formula**:
-```python
-is_healthy = (fill_ratio < 0.8) and (overflow_count == 0)
-```
-
-**Use**: Quick health check for monitoring
-
----
-
-## Exponential Moving Average (EMA)
-
-### Purpose
-
-Track **smoothed message rate** to detect trends and predict overflow.
-
-**Why EMA?**
-- ✅ Smooths out spikes (better than raw rate)
-- ✅ Reacts faster than simple moving average (SMA)
-- ✅ O(1) memory (no sliding window)
-
----
-
-### EMA Formula
-
-```
-EMA(t) = α × value(t) + (1 - α) × EMA(t-1)
-```
-
-**Where**:
-- `α` = Smoothing factor (0 < α < 1)
-- `value(t)` = Current measurement
-- `EMA(t-1)` = Previous EMA
-
-**Higher α** → More weight on recent values (faster reaction)
-
-**Lower α** → More smoothing (slower reaction)
-
----
-
-### Typical α Values
-
-| α | Half-life | Use Case |
-|---|-----------|----------|
-| 0.1 | ~7 samples | Long-term trend |
-| 0.2 | ~3 samples | Medium-term trend |
-| 0.5 | ~1 sample | Fast reaction |
-| 0.9 | <1 sample | Very fast reaction |
-
-**Recommendation**: α = 0.2 for message rate tracking
-
----
-
-### Message Rate EMA Example
+Usage from any thread:
 
 ```python
-import time
-
-class MessageRateEMA:
-    def __init__(self, alpha: float = 0.2):
-        self.alpha: float = alpha
-        self.ema: float = 0.0
-        self.last_count: int = 0
-        self.last_time: float = time.time()
-    
-    def update(self, current_count: int) -> float:
-        """Update EMA with current message count."""
-        now = time.time()
-        elapsed = now - self.last_time
-        
-        if elapsed > 0:
-            # Calculate instantaneous rate
-            rate = (current_count - self.last_count) / elapsed
-            
-            # Update EMA
-            self.ema = self.alpha * rate + (1 - self.alpha) * self.ema
-            
-            self.last_count = current_count
-            self.last_time = now
-        
-        return self.ema
-    
-    def get_ema(self) -> float:
-        """Get current EMA value."""
-        return self.ema
-
-# Usage
-ema_tracker = MessageRateEMA(alpha=0.2)
-total_received = 0
-
-for event in dispatcher.poll():
-    total_received += 1
-    process_event(event)
-    
-    # Update EMA every 100 messages
-    if total_received % 100 == 0:
-        ema_rate = ema_tracker.update(total_received)
-        print(f"Message rate EMA: {ema_rate:.2f} events/sec")
+h = dispatcher.health()
+print(h.drop_rate_ema)         # e.g. 0.003
+print(h.queue_utilization)     # e.g. 0.72
+print(h.total_dropped)         # e.g. 14
+print(h.total_pushed)          # e.g. 50000
 ```
 
----
+## EMA Formula
 
-## Health Monitoring Patterns
+On every call to `push()`, the Dispatcher updates its running EMA of the drop
+rate:
 
-### Periodic Health Check
+```text
+sample = 1.0   if the push caused a drop (queue was full before append)
+         0.0   otherwise
+
+ema = alpha * sample + (1 - alpha) * ema
+```
+
+This is a standard single-pole exponential moving average:
+
+- When drops are occurring (`sample = 1.0`), the EMA rises toward 1.0.
+- When no drops occur (`sample = 0.0`), the EMA decays toward 0.0.
+
+The update happens inside the hot-path `push()` method, so it adds negligible
+overhead -- a single multiply-add per push.
+
+## Configuration
+
+Both EMA parameters live in `DispatcherConfig`:
+
+| Parameter | Default | Constraint | Meaning |
+| --- | --- | --- | --- |
+| `ema_alpha` | 0.01 | gt=0.0, le=1.0 | Smoothing factor. Smaller values respond more slowly. Default gives roughly a 100-message half-life. |
+| `drop_warning_threshold` | 0.01 | gt=0.0, le=1.0 | EMA level that triggers a warning log. Default is 0.01 (1% drop rate). |
+
+Example with custom values:
 
 ```python
-import time
-from core.dispatcher import Dispatcher
+from core.dispatcher import Dispatcher, DispatcherConfig
 
-dispatcher = Dispatcher(maxsize=10000)
-
-def monitor_health():
-    while True:
-        health = dispatcher.get_health()
-        
-        if not health["is_healthy"]:
-            print(f"⚠️ Dispatcher unhealthy: {health}")
-        
-        time.sleep(1.0)  # Check every second
-
-# Run in separate thread
-import threading
-monitor_thread = threading.Thread(target=monitor_health, daemon=True)
-monitor_thread.start()
+cfg = DispatcherConfig(
+    maxlen=200_000,
+    ema_alpha=0.05,
+    drop_warning_threshold=0.02,
+)
+dispatcher: Dispatcher[BestBidAsk] = Dispatcher(config=cfg)
 ```
 
----
+## Warning and Recovery Logging
 
-### Alert on Fill Ratio
+The Dispatcher emits structured log messages when the EMA crosses the configured
+threshold:
+
+- **Warning log** -- emitted the first time `drop_rate_ema` rises above
+  `drop_warning_threshold`. This signals sustained backpressure, not just a
+  single dropped event.
+- **Info log (recovery)** -- emitted when the EMA falls back below the
+  threshold, indicating the consumer has caught up.
+
+Logging is limited to threshold-crossing transitions to avoid flooding the log
+during sustained drop periods.
+
+## Queue Utilisation
+
+```text
+queue_utilization = len(queue) / maxlen
+```
+
+This value ranges from 0.0 (empty) to 1.0 (full). It provides an at-a-glance
+measure of how close the queue is to capacity. A sustained value near 1.0
+combined with a rising `drop_rate_ema` indicates the consumer cannot keep up
+with the producer.
+
+## Effect of clear()
+
+Calling `clear()` resets the EMA to 0.0 along with all counters and the queue
+itself. After a clear, `health()` returns:
 
 ```python
-def check_fill_ratio(dispatcher: Dispatcher) -> None:
-    health = dispatcher.get_health()
-    fill_ratio = health["fill_ratio"]
-    
-    if fill_ratio > 0.8:
-        print(f"🚨 CRITICAL: Queue {fill_ratio*100:.1f}% full")
-    elif fill_ratio > 0.5:
-        print(f"⚠️ WARNING: Queue {fill_ratio*100:.1f}% full")
-    else:
-        print(f"✅ OK: Queue {fill_ratio*100:.1f}% full")
+DispatcherHealth(
+    drop_rate_ema=0.0,
+    queue_utilization=0.0,
+    total_dropped=0,
+    total_pushed=0,
+)
 ```
 
----
+This is intentional -- `clear()` represents a full lifecycle reset (e.g. on
+reconnect), so historical drop state should not carry over.
 
-### Alert on Overflow
+## Consistency Guarantees
 
-```python
-def check_overflow(dispatcher: Dispatcher) -> None:
-    health = dispatcher.get_health()
-    overflow = health["overflow_count"]
-    
-    if overflow > 0:
-        print(f"🚨 ALERT: {overflow} events dropped")
-```
+All fields returned by `health()` are **eventually consistent**. There are no
+locks protecting the reads. Instead, the SPSC thread-ownership contract ensures
+each value has a single writer:
 
----
+| Field | Written by |
+| --- | --- |
+| `drop_rate_ema` | MQTT IO thread (inside `push()`) |
+| `queue_utilization` | Derived from `len(queue)` and `maxlen` at read time |
+| `total_dropped` | MQTT IO thread (inside `push()`) |
+| `total_pushed` | MQTT IO thread (inside `push()`) |
 
-## Prometheus Integration
+CPython's GIL guarantees that individual int and float reads are atomic, so
+observer threads always see a valid (though potentially slightly stale) value
+without explicit locks.
 
-### Metrics Export
+## Interpreting the EMA
 
-```python
-from prometheus_client import Gauge, Counter
-
-# Define metrics
-queue_depth_gauge = Gauge('dispatcher_queue_depth', 'Current queue depth')
-queue_fill_ratio_gauge = Gauge('dispatcher_queue_fill_ratio', 'Queue fill ratio')
-overflow_counter = Counter('dispatcher_overflow_total', 'Total events dropped')
-message_rate_ema_gauge = Gauge('dispatcher_message_rate_ema', 'Message rate EMA')
-
-# Update metrics
-def export_metrics(dispatcher: Dispatcher, ema_tracker: MessageRateEMA):
-    health = dispatcher.get_health()
-    
-    queue_depth_gauge.set(health["queue_depth"])
-    queue_fill_ratio_gauge.set(health["fill_ratio"])
-    overflow_counter._value.set(health["overflow_count"])  # Set counter directly
-    message_rate_ema_gauge.set(ema_tracker.get_ema())
-```
-
----
-
-### Alerting Rules
-
-**Queue fill ratio alert**:
-```yaml
-- alert: DispatcherQueueFilling
-  expr: dispatcher_queue_fill_ratio > 0.8
-  for: 1m
-  labels:
-    severity: warning
-  annotations:
-    summary: "Dispatcher queue filling up"
-    description: "Queue is {{ $value | humanizePercentage }} full"
-```
-
-**Overflow alert**:
-```yaml
-- alert: DispatcherOverflow
-  expr: rate(dispatcher_overflow_total[1m]) > 0
-  for: 1m
-  labels:
-    severity: critical
-  annotations:
-    summary: "Dispatcher overflow detected"
-    description: "Events are being dropped"
-```
-
----
-
-## Health Check Endpoint
-
-```python
-from flask import Flask, jsonify
-from core.dispatcher import Dispatcher
-
-app = Flask(__name__)
-dispatcher = Dispatcher(maxsize=10000)
-
-@app.route("/health")
-def health():
-    health_data = dispatcher.get_health()
-    
-    status_code = 200 if health_data["is_healthy"] else 503
-    
-    return jsonify(health_data), status_code
-
-# Usage
-# curl http://localhost:5000/health
-```
-
----
-
-## Implementation Reference
-
-See [core/dispatcher.py](../../core/dispatcher.py):
-- `get_health()` method
-- Health metrics calculation
-- Overflow tracking
-
----
+| `drop_rate_ema` range | Interpretation |
+| --- | --- |
+| 0.0 | No drops have occurred recently. |
+| 0.001 -- 0.01 | Occasional drops, likely transient bursts. |
+| 0.01 -- 0.05 | Moderate sustained backpressure. Investigate consumer throughput. |
+| 0.05 -- 0.20 | Heavy backpressure. Consumer is significantly behind. |
+| above 0.20 | Severe. Nearly every push is evicting data. Consider increasing `maxlen` or optimising the consumer. |
 
 ## Test Coverage
 
-Key tests in `test_dispatcher.py`:
-- `test_get_health_returns_metrics` — Health metrics
-- `test_get_health_fill_ratio` — Fill ratio calculation
-- `test_get_health_is_healthy` — Health status logic
+Tests confirm:
 
----
-
-## Next Steps
-
-- **[Queue Model](./queue_model.md)** — Queue architecture
-- **[Overflow Policy](./overflow_policy.md)** — Overflow handling
-- **[Metrics Reference](../07_observability/metrics_reference.md)** — All metrics
-- **[Tuning Guide](../09_production_guide/tuning_guide.md)** — Performance tuning
+- EMA rises when drops occur
+- EMA decays toward zero when no drops occur
+- `queue_utilization` is correct relative to current queue length and `maxlen`
+- `clear()` resets EMA to 0.0
+- All health fields are non-negative and within documented bounds

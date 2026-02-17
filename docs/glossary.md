@@ -1,232 +1,187 @@
 # Glossary
 
-Terminology reference for settrade-feed-adapter.
+Terminology reference for the settrade-feed-adapter project.
 
 ---
 
-## General Terms
+## General
 
-### Adapter
-A component that translates between protocols. In this project, adapters parse protobuf messages and convert them to typed event models (e.g., `BidOfferAdapter`).
+**Feed adapter** -- The complete system that receives raw MQTT market data
+from the Settrade broker, parses protobuf messages, normalizes them into
+typed event models, and delivers them to a strategy consumer via a bounded
+queue.
 
-### Backpressure
-A mechanism for handling situations where events arrive faster than they can be processed. This project uses a **drop-oldest** policy.
+**Hot path** -- The code path executed for every incoming MQTT message:
+`on_message` callback -> protobuf parse -> event construction -> `push()`.
+All hot-path code avoids locks, exceptions for control flow, and unnecessary
+allocations.
 
-### Bounded Queue
-A queue with a fixed maximum capacity (`maxlen`). When full, adding a new item evicts the oldest item.
-
-### Connection Epoch
-An integer counter that increments on every MQTT reconnect. Used by strategy code to detect reconnects and clear state.
-
-### Dispatcher
-The bounded event queue that decouples the MQTT IO thread (producer) from the strategy thread (consumer).
-
-### Drop-Oldest Policy
-Backpressure strategy where the oldest event in the queue is evicted when the queue is full. Correct for market data where stale data is worthless.
-
-### Event Model
-A typed, immutable Pydantic model representing normalized market data (e.g., `BestBidAsk`, `FullBidOffer`).
-
-### Generation
-An integer counter that increments on every reconnect. Used to reject stale messages from old connections.
-
-### GIL (Global Interpreter Lock)
-CPython's mechanism that ensures only one thread executes Python bytecode at a time. Makes `deque.append()` and `deque.popleft()` atomic.
-
-### Hot Path
-The critical code path where latency is most important. In this project, the hot path is: MQTT callback → parse → normalize → push to queue.
-
-### Monotonic Timestamp
-A timestamp from `time.perf_counter_ns()` that never goes backwards, even if the system clock is adjusted (NTP). Used for latency measurement.
-
-### Normalization
-The process of converting raw protobuf data into a standardized format (e.g., uppercase symbols, float prices).
-
-### SPSC (Single Producer, Single Consumer)
-A concurrency pattern where exactly one thread produces items and exactly one thread consumes items. This project's dispatcher is SPSC.
-
-### Wall Clock Timestamp
-A timestamp from `time.time_ns()` that represents actual calendar time. Subject to NTP adjustment.
+**Cold path** -- Code that runs infrequently: `connect()`, `subscribe()`,
+`shutdown()`, `stats()`. May use locks and perform I/O.
 
 ---
 
-## MQTT Terms
+## MQTT
 
-### Clean Session
-MQTT client flag (`clean_session=True`) that disables persistent subscriptions and queued messages. Correct for real-time data feeds.
+**paho-mqtt** -- The Python MQTT client library used for broker connectivity.
+Runs a background IO loop thread for message dispatch.
 
-### Keepalive
-MQTT interval (seconds) between heartbeat messages. Detects stale connections.
+**MQTT IO thread** -- The background thread managed by `paho-mqtt`'s
+`loop_start()`. All `on_message` callbacks execute in this thread.
 
-### QoS (Quality of Service)
-MQTT delivery guarantee level (0, 1, or 2). This project uses QoS 0 (at-most-once) for freshness over reliability.
+**WebSocket+TLS (WSS)** -- The transport protocol used to connect to the
+Settrade MQTT broker on port 443.
 
-### Topic
-MQTT subscription path (e.g., `proto/topic/bidofferv3/AOT`). Uses hierarchical structure with `/` separator.
+**clean_session** -- MQTT connection flag set to `True`. Means no QoS
+persistence, no message replay on reconnect. Prioritizes freshness over
+reliability.
 
-### WebSocket Secure (WSS)
-MQTT transport over WebSocket with TLS encryption. Used by Settrade Open API (port 443).
-
----
-
-## Market Data Terms
-
-### ATC (At-The-Close)
-Auction period at market close. Prices are zero during ATC.
-
-### ATO (At-The-Opening)
-Auction period at market open. Prices are zero during ATO.
-
-### Best Bid/Ask
-Top-of-book prices (best bid price and best ask price). Also called Level 1 data.
-
-### Bid Flag / Ask Flag
-Market session indicator: `1=NORMAL`, `2=ATO`, `3=ATC`.
-
-### BidOfferV3
-Settrade protobuf message containing full order book data (10 bid/ask levels).
-
-### Full Depth
-Complete order book (10 bid levels + 10 ask levels). Also called Level 2 or Market Depth.
-
-### Money Type
-Protobuf message with `units` (int64) and `nanos` (int32) fields. Converted to float: `units + nanos * 1e-9`.
-
-### Symbol
-Stock ticker (e.g., "AOT", "PTT"). Normalized to uppercase in this project.
+**Topic** -- An MQTT subscription path. BidOfferV3 topics follow the pattern
+`proto/topic/bidofferv3/{symbol}`.
 
 ---
 
-## Performance Terms
+## Market Data
 
-### EMA (Exponential Moving Average)
-Weighted average that gives more weight to recent values. Used to smooth drop rate measurements.
+**BidOfferV3** -- The protobuf message type published by the Settrade broker
+containing 10-level bid/ask prices, volumes, and session flags.
 
-### Latency Measurement
-Time elapsed from message receipt to processing. Measured using monotonic timestamps.
+**Money** -- A protobuf nested message with `units` (int) and `nanos` (int)
+fields representing a monetary value. Converted to float via
+`units + nanos * 1e-9`.
 
-### P50 / P95 / P99 Percentiles
-Statistical measures of latency distribution:
-- P50 (median): 50% of measurements are below this value
-- P95: 95% of measurements are below this value
-- P99: 99% of measurements are below this value
+**BestBidAsk** -- A normalized event model containing only the best (level 1)
+bid and ask price/volume. Default output of `BidOfferAdapter`.
 
-### Parse Latency
-Time spent parsing protobuf and normalizing to event model.
+**FullBidOffer** -- A normalized event model containing all 10 levels of
+bid/ask prices and volumes. Produced when `full_depth=True`.
 
-### Queue Wait Time
-Time an event spends waiting in the dispatcher queue before being polled.
+**BidAskFlag** -- An `IntEnum` indicating the market session: `UNDEFINED` (0),
+`NORMAL` (1), `ATO` (2), `ATC` (3).
 
-### Warmup Period
-Initial messages discarded from benchmark measurements to avoid cold-start effects (TLS handshake, bytecode cache, etc.).
+**ATO (At-The-Opening)** -- Auction session at market open. Bid/ask prices
+are zero during ATO.
 
----
+**ATC (At-The-Close)** -- Auction session at market close. Bid/ask prices
+are zero during ATC.
 
-## Configuration Terms
-
-### alpha (EMA Alpha)
-Smoothing factor for exponential moving average (0 < alpha < 1). Smaller values → smoother signal.
-
-### gap_ms
-Maximum time (milliseconds) between messages before feed is considered stale.
-
-### maxlen
-Maximum queue capacity (default 100,000 events).
-
-### reconnect_min_delay / reconnect_max_delay
-Exponential backoff bounds for reconnect attempts (seconds).
-
-### token_refresh_before_exp_seconds
-Seconds before token expiry to trigger proactive reconnect for token refresh.
+**connection_epoch** -- An integer counter on each event that increments on
+every MQTT reconnect after subscription replay. Starts at 0 for the initial
+connection. Allows strategy code to detect reconnects.
 
 ---
 
-## Testing Terms
+## Performance
 
-### Invariant
-A property that must always be true. Example: `total_pushed - total_dropped - total_polled == queue_len`.
+**P50 / P95 / P99** -- Percentile latency measurements. P99 means 99% of
+messages were processed in less than this time.
 
-### Mock
-A test double that simulates external dependencies (e.g., mock MQTT client).
+**EMA (Exponential Moving Average)** -- A smoothed signal computed as
+`ema = alpha * sample + (1 - alpha) * ema`. Used for drop rate tracking
+in the dispatcher.
 
-### Synthetic Payload
-Artificially generated protobuf message for benchmark testing (deterministic, no network latency).
+**model_construct()** -- Pydantic method that creates a model instance
+without running validation. Used in the hot path to avoid validation overhead.
 
----
+**Warmup** -- The first N messages (default 1000) discarded from benchmark
+statistics to account for CPython 3.11+ adaptive specialization.
 
-## State Machine Terms
-
-### INIT
-Initial state after client creation, before `connect()` called.
-
-### CONNECTING
-Authentication complete, MQTT connection in progress.
-
-### CONNECTED
-MQTT connected and subscriptions active.
-
-### RECONNECTING
-Disconnected, background reconnect loop running.
-
-### SHUTDOWN
-Terminal state, no further reconnects allowed.
+**Linear interpolation percentile** -- The percentile method used by the
+benchmark, matching `numpy.percentile(method='linear')`. Interpolates between
+adjacent sorted ranks.
 
 ---
 
-## Architecture Terms
+## Configuration
 
-### Adapter Layer (Phase 2)
-Component responsible for protobuf parsing and normalization.
+**maxlen** -- Maximum number of events the dispatcher queue can hold.
+Default 100,000. When full, the oldest event is evicted (drop-oldest policy).
 
-### Dispatcher Layer (Phase 3)
-Component responsible for bounded queuing and backpressure.
+**ema_alpha** -- Smoothing factor for the drop rate EMA. Default 0.01.
+Smaller values produce smoother signals with slower response.
 
-### Transport Layer (Phase 1)
-Component responsible for MQTT connection, authentication, and reconnection.
+**drop_warning_threshold** -- EMA threshold that triggers a warning log.
+Default 0.01 (1% drop rate).
 
-### Strategy Layer
-Your application code that processes events from the dispatcher.
+**max_gap_seconds** -- Maximum time in seconds without events before the feed
+is considered dead. Default 5.0. Converted to nanoseconds internally.
 
----
+**per_symbol_max_gap** -- Dictionary of symbol-specific staleness thresholds.
+Symbols not listed use the global `max_gap_seconds`.
 
-## Error Terms
+**reconnect_min_delay** -- Minimum backoff delay for reconnect attempts.
+Default 1.0 seconds.
 
-### Callback Error
-Exception raised in user-defined callback function. Counted separately, does not crash MQTT client.
+**reconnect_max_delay** -- Maximum backoff delay for reconnect attempts.
+Default 30.0 seconds.
 
-### Error Isolation
-Design pattern where errors in one layer do not propagate to other layers.
+**token_refresh_before_exp_seconds** -- Seconds before token expiry to
+trigger a controlled reconnect. Default 100.
 
-### Parse Error
-Exception during protobuf parsing or normalization. Counted separately, does not crash adapter.
-
----
-
-## Common Acronyms
-
-- **API**: Application Programming Interface
-- **CPU**: Central Processing Unit
-- **EMA**: Exponential Moving Average
-- **FIFO**: First In, First Out
-- **GC**: Garbage Collection
-- **GIL**: Global Interpreter Lock
-- **HFT**: High-Frequency Trading
-- **I/O**: Input/Output
-- **MQTT**: Message Queuing Telemetry Transport
-- **MPMC**: Multi-Producer, Multi-Consumer
-- **NTP**: Network Time Protocol
-- **QoS**: Quality of Service
-- **SDK**: Software Development Kit
-- **SPSC**: Single Producer, Single Consumer
-- **TDD**: Test-Driven Development
-- **TLS**: Transport Layer Security
-- **UAT**: User Acceptance Testing (sandbox environment)
-- **WSS**: WebSocket Secure (WebSocket over TLS)
+**full_depth** -- Boolean flag on `BidOfferAdapterConfig`. When `True`,
+produces `FullBidOffer` events with all 10 levels. Default `False`.
 
 ---
 
-## Next Steps
+## Testing
 
-- **[What Is This?](./00_getting_started/what_is_this.md)** — Overview
-- **[Architecture](./01_system_overview/architecture.md)** — Component-level design
-- **[Event Contract](./04_event_models/event_contract.md)** — Event model specifications
+**Invariant** -- A property that must always hold. The primary dispatcher
+invariant: `total_pushed - total_dropped - total_polled == queue_len`.
+
+**Quiescent conditions** -- No concurrent `push()` or `poll()` operations
+are in progress. Under quiescent conditions, all counters and queue length
+are exactly consistent.
+
+**Eventually consistent** -- Values may reflect slightly different points in
+time under concurrent access, but converge to consistent state when
+operations quiesce.
+
+---
+
+## State Machine
+
+**ClientState** -- The connection state machine for `SettradeMQTTClient`:
+
+- `INIT` -- Client created, `connect()` not yet called.
+- `CONNECTING` -- Authentication complete, MQTT connect in progress.
+- `CONNECTED` -- MQTT connected, subscriptions active.
+- `RECONNECTING` -- Disconnected, background reconnect loop running.
+- `SHUTDOWN` -- Terminal state after `shutdown()`.
+
+---
+
+## Architecture
+
+**SPSC (Single-Producer, Single-Consumer)** -- The threading contract for the
+dispatcher. Only one thread pushes (MQTT IO), only one thread polls
+(strategy). Violating this invalidates all safety guarantees.
+
+**Drop-oldest** -- The backpressure policy. When the queue is full, the oldest
+event is evicted to make room for the new one. Stale market data is worthless.
+
+**Generation** -- An integer incremented each time a new paho-mqtt client is
+created. Captured in the `on_message` closure to reject callbacks from
+previous client instances.
+
+**Subscription replay** -- After reconnecting, all topics in the
+`_subscriptions` dictionary are re-subscribed on the new MQTT client.
+
+---
+
+## Error Handling
+
+**Error isolation** -- Parse errors and callback errors are tracked in
+separate counters. A parse failure does not increment the callback error
+counter, and vice versa.
+
+**Rate-limited logging** -- In the hot path, the first 10 errors are logged
+with full stack traces (`logger.exception()`), then every 1000th error is
+logged at `logger.error()` level without a trace.
+
+**Exponential backoff with jitter** -- Reconnect retry strategy. Delay
+doubles each attempt (up to `reconnect_max_delay`) and is randomized by
++/-20% to prevent thundering herd.
+
+**Controlled reconnect** -- A reconnect triggered by the token refresh timer
+rather than a network failure. Uses the same reconnect guard and backoff
+mechanism.

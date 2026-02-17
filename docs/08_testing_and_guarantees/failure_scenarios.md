@@ -1,362 +1,206 @@
 # Failure Scenarios
 
-Comprehensive error handling coverage.
+How the feed adapter handles errors at each layer.
 
 ---
 
 ## Overview
 
-This document catalogs all failure scenarios covered by tests and explains the error isolation strategy.
+The feed adapter is designed so that no single failure takes down the system.
+Each error is counted, logged (with rate limiting), and isolated so that
+processing continues for subsequent messages.
 
 ---
 
-## Transport Layer Failures
+## Parse Error
 
-### 1. Network Disconnect
+**Trigger:** Corrupted or incompatible protobuf payload arrives on a
+BidOfferV3 topic.
 
-**Scenario**: MQTT connection drops unexpectedly.
+**Behavior:**
 
-**Behavior**:
-- `on_disconnect()` callback triggered
-- State transitions to `RECONNECTING`
-- Generation counter incremented
-- Reconnect loop spawned with exponential backoff
+1. `BidOfferV3().parse(payload)` raises an exception.
+2. `_parse_errors` counter increments by 1.
+3. Error is logged via `_log_parse_error()` (rate-limited: first 10 with full
+   stack trace via `logger.exception()`, then every 1000th at `logger.error()`).
+4. The `_on_message` callback returns early.
+5. `_callback_errors` is NOT incremented.
+6. `_messages_parsed` is NOT incremented.
+7. The adapter continues processing the next message.
 
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestReconnect::test_on_disconnect_unexpected_triggers_reconnect`
-
-**Recovery**: Automatic reconnect, connection epoch incremented on success.
-
----
-
-### 2. Authentication Failure
-
-**Scenario**: Invalid credentials or token expired.
-
-**Behavior**:
-- `login()` raises exception
-- Exception propagated to caller
-- State remains `INIT`
-
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestTokenRefresh::test_fetch_host_token_raises_without_login`
-
-**Recovery**: Manual - fix credentials and retry `connect()`.
+**Source:** `infra/settrade_adapter.py` -- `_on_message()` lines 392-395
 
 ---
 
-### 3. Connection Timeout
+## Callback Error
 
-**Scenario**: Broker unreachable or network issue.
+**Trigger:** The downstream `on_event` callback raises an exception (e.g.,
+dispatcher is full, strategy code throws).
 
-**Behavior**:
-- `connect()` times out (paho-mqtt default: 60s)
-- Exception raised
-- State remains `CONNECTING`
+**Behavior:**
 
-**Recovery**: Retry `connect()` or check network connectivity.
+1. Protobuf parsing succeeds (event is constructed).
+2. `self._on_event(event)` raises an exception.
+3. `_callback_errors` counter increments by 1.
+4. Error is logged via `_log_callback_error()` (same rate-limiting as parse errors).
+5. The `_on_message` callback returns early.
+6. `_parse_errors` is NOT incremented.
+7. `_messages_parsed` is NOT incremented.
+8. The adapter continues processing the next message.
 
----
-
-### 4. Reconnect Storm
-
-**Scenario**: Rapid disconnect/reconnect cycles.
-
-**Behavior**:
-- Exponential backoff prevents tight loop
-- `reconnect_min_delay` → `reconnect_max_delay` (e.g., 1s → 16s)
-- Only one reconnect thread runs at a time
-
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestReconnect::test_schedule_reconnect_prevents_duplicates`
-
-**Recovery**: Automatic, backoff prevents overwhelming broker.
+**Source:** `infra/settrade_adapter.py` -- `_on_message()` lines 400-403
 
 ---
 
-### 5. Token Expiration
+## Reconnect on Unexpected Disconnect
 
-**Scenario**: Token expires during connection.
+**Trigger:** MQTT broker drops the connection unexpectedly (`on_disconnect`
+with `rc != 0`).
 
-**Behavior**:
-- Proactive disconnect before expiration (`token_refresh_before_exp_seconds`)
-- Fetch new token
-- Reconnect with new credentials
+**Behavior:**
 
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestTokenRefresh::test_token_refresh_triggers_reconnect`
+1. `_last_disconnect_ts` is recorded.
+2. If state is `SHUTDOWN`, the disconnect is ignored.
+3. Otherwise, `_schedule_reconnect()` is called.
+4. The `_reconnecting` flag under `_reconnect_lock` prevents duplicate
+   reconnect threads.
+5. `_reconnect_loop()` runs in a daemon thread with exponential backoff:
+   - Starts at `reconnect_min_delay` (default 1.0s).
+   - Doubles each failed attempt up to `reconnect_max_delay` (default 30.0s).
+   - Each delay is jittered by +/-20% (`random.uniform(0.8, 1.2)`).
+6. Each attempt: fetches fresh host/token, creates a new MQTT client (new
+   generation), and calls `connect()`.
+7. On TCP success, `_reconnect_count` increments and the loop exits.
+8. State transitions to `CONNECTED` only in `on_connect` (not in the
+   reconnect loop), ensuring MQTT-level authentication is confirmed.
+9. After `on_connect` with `rc=0`, all subscriptions are replayed from the
+   source-of-truth dictionary.
+10. `_reconnect_epoch` increments by 1 after subscription replay (not on
+    initial connection).
 
-**Recovery**: Automatic token refresh.
-
----
-
-## Adapter Layer Failures
-
-### 6. Parse Error
-
-**Scenario**: Malformed protobuf payload.
-
-**Behavior**:
-- `BidOfferV3().parse(payload)` raises exception
-- Exception caught in adapter
-- `parse_errors` counter incremented
-- Error logged
-- Continue processing (no crash)
-
-**Test Coverage**:
-- `test_settrade_adapter.py::TestErrorHandling::test_parse_error_logged_and_counted`
-
-**Recovery**: Automatic - skip bad message, continue.
+**Source:** `infra/settrade_mqtt.py` -- `_schedule_reconnect()`, `_reconnect_loop()`
 
 ---
 
-### 7. Invalid Money Field
+## Token Refresh
 
-**Scenario**: Money field has invalid `units` or `nanos`.
+**Trigger:** The access token is approaching expiry (within
+`token_refresh_before_exp_seconds`, default 100 seconds).
 
-**Behavior**:
-- Conversion to float may produce `inf` or `nan`
-- Pydantic validation rejects invalid float
-- Treated as parse error
+**Behavior:**
 
-**Recovery**: Automatic - skip bad message, log error.
+1. The `_token_refresh_check` background thread detects the upcoming expiry.
+2. It calls `_schedule_reconnect()` to trigger a controlled reconnect.
+3. The reconnect flow fetches a fresh token via `_fetch_host_token()` (which
+   calls the SDK's `dispatch()`, auto-refreshing the access token).
+4. A new MQTT client is created with fresh WebSocket headers containing the
+   new token.
+5. The controlled reconnect may cause brief downtime (~1-3s).
 
----
+This uses the same reconnect guard as disconnect-triggered reconnects,
+preventing dual reconnect flows if a timer and network drop coincide.
 
-### 8. Missing Required Field
-
-**Scenario**: Protobuf message missing required field.
-
-**Behavior**:
-- betterproto returns default value (0, empty string, etc.)
-- Event constructed with default value
-- **No error** (proto3 semantics)
-
-**Note**: proto3 has no concept of "required" fields.
+**Source:** `infra/settrade_mqtt.py` -- `_token_refresh_check()`
 
 ---
 
-## Dispatcher Layer Failures
+## Feed Silence
 
-### 9. Queue Overflow
+**Trigger:** The MQTT connection is alive but no messages arrive (silent
+broker, exchange closed, subscription lost).
 
-**Scenario**: Events arrive faster than strategy can consume.
+**Behavior:**
 
-**Behavior**:
-- Queue reaches `maxlen`
-- `deque.append()` automatically drops oldest
-- `total_dropped` counter incremented
-- EMA drop rate updated
-- Warning logged if threshold exceeded
+1. `FeedHealthMonitor.on_event()` stops being called.
+2. `is_feed_dead()` returns `True` once the gap exceeds `max_gap_seconds`.
+3. `stale_symbols()` returns symbols whose individual gaps exceed their
+   thresholds.
+4. Strategy code can detect this and take action (pause trading, alert ops).
 
-**Test Coverage**:
-- `test_dispatcher.py::TestOverflowDrops::test_drop_at_maxlen_boundary`
-- `test_dispatcher.py::TestOverflowDrops::test_drop_count_matches_evicted_events`
+The feed health monitor does not trigger reconnects automatically. It is a
+diagnostic tool -- the strategy decides what action to take.
 
-**Recovery**: Increase polling frequency, optimize processing,or increase maxlen.
-
----
-
-### 10. poll() Called with Zero Events
-
-**Scenario**: `dispatcher.poll(max_events=0)`.
-
-**Behavior**:
-- Pydantic validation raises `ValidationError`
-- Exception propagated to caller
-
-**Test Coverage**:
-- `test_dispatcher.py::TestInputValidation::test_poll_zero_raises_value_error`
-
-**Recovery**: Fix caller code.
+**Source:** `core/feed_health.py` -- `is_feed_dead()`, `stale_symbols()`
 
 ---
 
-## Strategy Layer Failures
+## Queue Overflow (Drop Burst)
 
-### 11. Callback Exception
+**Trigger:** Events arrive faster than the strategy can consume them (the
+queue fills to `maxlen`).
 
-**Scenario**: User callback raises exception.
+**Behavior:**
 
-**Behavior**:
-- Exception caught in MQTT client
-- `callback_errors` counter incremented
-- Error logged
-- Continue processing other callbacks
+1. `Dispatcher.push()` checks `len(queue) == maxlen`.
+2. If full, `_total_dropped` increments by 1.
+3. `deque.append()` evicts the oldest item automatically (drop-oldest policy).
+4. The new event is inserted at the tail.
+5. The EMA drop rate is updated: `ema = alpha * 1.0 + (1 - alpha) * ema`.
+6. If the EMA crosses `drop_warning_threshold` (default 0.01), a warning is
+   logged once.
+7. When the EMA recovers below the threshold, an info-level recovery is logged.
 
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestMessageDispatch::test_callback_isolation`
-- `test_settrade_mqtt.py::TestMessageDispatch::test_callback_error_increments_counter`
+Stale market data is worthless -- new data always wins. The drop-oldest policy
+ensures the consumer always sees the freshest data.
 
-**Recovery**: Automatic - fix callback code, errors isolated.
-
----
-
-### 12. Processing Too Slow
-
-**Scenario**: Strategy processing slower than event arrival rate.
-
-**Behavior**:
-- Queue fills up
-- Drop-oldest policy activated
-- `total_dropped` increments
-
-**Indicators**:
-- `dispatcher.stats().total_dropped > 0`
-- `dispatcher.stats().queue_len == maxlen`
-- EMA drop rate rising
-
-**Recovery**: Optimize processing, increase polling frequency, or offload to worker threads.
+**Source:** `core/dispatcher.py` -- `push()`
 
 ---
 
-## Feed Health Failures
+## Shutdown During Reconnect
 
-### 13. Feed Silence
+**Trigger:** `shutdown()` is called while `_reconnect_loop()` is running.
 
-**Scenario**: No messages received for > `gap_ms`.
+**Behavior:**
 
-**Behavior**:
-- `is_feed_dead()` returns `True`
-- Strategy can detect and alert
+1. `shutdown()` sets state to `SHUTDOWN` under `_state_lock`.
+2. `_shutdown_event.set()` signals all background threads.
+3. `_reconnect_loop()` checks `self._shutdown_event.is_set()` at the top of
+   each retry iteration and exits the loop.
+4. The `finally` block clears `_reconnecting = False`.
+5. `shutdown()` stops the MQTT IO loop and disconnects.
 
-**Test Coverage**:
-- `test_feed_health.py::TestGlobalLiveness::test_is_feed_dead_boundary`
+The reconnect loop uses `_shutdown_event.wait(timeout=delay)` instead of
+`time.sleep()`, so it responds immediately to shutdown signals without
+waiting for the backoff delay to expire.
 
-**Recovery**: Check broker connection, verify subscriptions.
-
----
-
-### 14. Symbol Stale
-
-**Scenario**: Specific symbol has no updates for > `per_symbol_gap`.
-
-**Behavior**:
-- `stale_symbols()` returns list including that symbol
-- Strategy can detect per-symbol staleness
-
-**Test Coverage**:
-- `test_feed_health.py::TestPerSymbolTracking::test_per_symbol_gap_override`
-
-**Recovery**: Check symbol subscription, verify market hours.
+**Source:** `infra/settrade_mqtt.py` -- `_reconnect_loop()`, `shutdown()`
 
 ---
 
-## Configuration Failures
+## MQTT Connection Failure (on_connect with rc != 0)
 
-### 15. Invalid maxlen
+**Trigger:** MQTT-level authentication fails after TCP connect succeeds.
 
-**Scenario**: `maxlen <= 0`.
+**Behavior:**
 
-**Behavior**:
-- Pydantic validation raises `ValidationError`
-- Construction fails
+1. `on_connect` fires with `rc != 0`.
+2. State does NOT transition to `CONNECTED`.
+3. `_schedule_reconnect()` is called to retry with fresh credentials.
 
-**Test Coverage**:
-- `test_dispatcher.py::TestDispatcherConfig::test_maxlen_zero_rejected`
-- `test_dispatcher.py::TestDispatcherConfig::test_maxlen_negative_rejected`
+This is why state transitions to `CONNECTED` only happen in `on_connect` --
+TCP connect success does not guarantee MQTT-level authentication success.
 
-**Recovery**: Fix configuration.
-
----
-
-### 16. Invalid Reconnect Delays
-
-**Scenario**: `reconnect_min_delay > reconnect_max_delay`.
-
-**Behavior**:
-- Pydantic validation raises `ValidationError`
-- Construction fails
-
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestMQTTClientConfig::test_reconnect_min_delay_constraint`
-
-**Recovery**: Fix configuration.
+**Source:** `infra/settrade_mqtt.py` -- `_on_connect()`
 
 ---
 
-## State Machine Violations
+## Summary Table
 
-### 17. connect() Called After connect()
-
-**Scenario**: `client.connect()` called twice.
-
-**Behavior**:
-- Validation rejects (state != INIT)
-- Raises `ValueError`
-
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestStateMachine::test_connect_rejects_non_init_state`
-
-**Recovery**: Check state before calling `connect()`.
+| Failure | Detection | Recovery | Continues? |
+| --- | --- | --- | --- |
+| Parse error | `parse_errors` counter | Rate-limited logging | Yes |
+| Callback error | `callback_errors` counter | Rate-limited logging | Yes |
+| Unexpected disconnect | `on_disconnect` callback | Auto-reconnect with backoff | Yes |
+| Token expiry | Background timer | Controlled reconnect | Yes |
+| Feed silence | `is_feed_dead()` | Strategy-driven | Yes |
+| Queue overflow | `total_dropped`, `drop_rate_ema` | Drop-oldest, EMA warning | Yes |
+| Shutdown during reconnect | `_shutdown_event` | Clean exit | Terminal |
 
 ---
 
-### 18. Reconnect After Shutdown
+## Related Pages
 
-**Scenario**: Network disconnect after `shutdown()`.
-
-**Behavior**:
-- `on_disconnect()` checks state
-- If state == SHUTDOWN, no reconnect
-
-**Test Coverage**:
-- `test_settrade_mqtt.py::TestReconnect::test_schedule_reconnect_blocked_after_shutdown`
-
-**Recovery**: None - shutdown is terminal.
-
----
-
-## Error Isolation Strategy
-
-### Layer Boundaries
-
-```
-┌─────────────────────────────┐
-│  Strategy Error             │ → Your responsibility
-└─────────────────────────────┘
-
-┌─────────────────────────────┐
-│  Dispatcher Overflow        │ → Drop oldest + counter++
-└─────────────────────────────┘
-
-┌─────────────────────────────┐
-│  Parse Error (Adapter)      │ → Log + parse_errors++
-└─────────────────────────────┘
-
-┌─────────────────────────────┐
-│  Callback Error (MQTT)      │ → Log + callback_errors++
-└─────────────────────────────┘
-
-┌─────────────────────────────┐
-│  Network Disconnect         │ → Auto-reconnect loop
-└─────────────────────────────┘
-```
-
-**Key Principle**: Errors **never propagate** across layer boundaries.
-
----
-
-## Monitoring Recommendations
-
-### Counters to Watch
-
-1. **`parse_errors`**: Should be zero. Non-zero indicates protocol changes or corruption.
-2. **`callback_errors`**: Indicates bugs in strategy code.
-3. **`total_dropped`**: Indicates backpressure. Strategy too slow.
-4. **`reconnect_count`**: High value indicates network instability.
-
-### Alerts to Configure
-
-- **Parse errors > 0**: Protocol issue or corruption
-- **Drop rate EMA > threshold**: Backpressure
-- **Feed dead**: No messages for > gap_ms
-- **Reconnect storm**: > 5 reconnects in 1 minute
-
----
-
-## Next Steps
-
-- **[Invariants Defined by Tests](./invariants_defined_by_tests.md)** — Design guarantees
-- **[Failure Playbook](../09_production_guide/failure_playbook.md)** — Troubleshooting guide
-- **[Metrics Reference](../07_observability/metrics_reference.md)** — All metrics documented
+- [Invariants Defined by Tests](./invariants_defined_by_tests.md) -- tested guarantees
+- [Concurrency Guarantees](./concurrency_guarantees.md) -- thread safety
+- [Failure Playbook](../09_production_guide/failure_playbook.md) -- operational response

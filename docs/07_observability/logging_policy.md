@@ -1,456 +1,186 @@
 # Logging Policy
 
-Structured logging standards and best practices.
+How the feed adapter uses Python stdlib logging, including rate limiting in
+hot paths.
 
 ---
 
 ## Overview
 
-**Logging policy** defines:
-- ✅ **What** to log (events, errors, state changes)
-- ✅ **How** to log (structured format, levels)
-- ✅ **When** to log (frequency, conditions)
-- ✅ **Where** to log (stdout, files, external systems)
+All logging uses Python's standard `logging` module. Each module creates its
+own logger via `logging.getLogger(__name__)`. No third-party logging libraries
+are used.
 
 ---
 
-## Log Levels
+## Rate-Limited Hot-Path Logging
 
-### DEBUG
+The adapter's `_on_message()` callback runs inline in the MQTT IO thread at
+high message rates. Logging every error at full verbosity would cause log
+storms that overwhelm the system. The adapter uses a two-tier rate-limiting
+strategy.
 
-**Purpose**: Detailed diagnostic information for development.
+### Tier 1: First 10 Errors (Full Stack Trace)
 
-**When**: Development, debugging, troubleshooting
-
-**Example**:
-```python
-logger.debug("Received MQTT message", extra={"topic": topic, "size": len(payload)})
-```
-
-**Production**: Usually disabled (high volume)
-
----
-
-### INFO
-
-**Purpose**: General informational messages about system state.
-
-**When**: Normal operations, state transitions
-
-**Example**:
-```python
-logger.info("MQTT connected", extra={"broker": "mqtt.settrade.com", "port": 8883})
-```
-
-**Production**: Enabled (low volume)
-
----
-
-### WARNING
-
-**Purpose**: Unexpected but recoverable conditions.
-
-**When**: Overflow, stale symbols, retry attempts
-
-**Example**:
-```python
-logger.warning(
-    "Dispatcher overflow",
-    extra={
-        "queue_size": dispatcher._queue.qsize(),
-        "maxsize": dispatcher._maxsize,
-        "overflow_count": dispatcher._overflow_count,
-    }
-)
-```
-
-**Production**: Enabled (always investigate)
-
----
-
-### ERROR
-
-**Purpose**: Error conditions requiring attention.
-
-**When**: Parse failures, connection errors, exceptions
-
-**Example**:
-```python
-logger.error(
-    "Failed to parse message",
-    extra={
-        "topic": topic,
-        "error": str(e),
-        "traceback": traceback.format_exc(),
-    }
-)
-```
-
-**Production**: Enabled (always investigate)
-
----
-
-### CRITICAL
-
-**Purpose**: System-level failures requiring immediate action.
-
-**When**: Unrecoverable errors, system shutdown
-
-**Example**:
-```python
-logger.critical(
-    "Cannot connect to MQTT broker after max retries",
-    extra={
-        "broker": broker_url,
-        "retry_count": max_retries,
-    }
-)
-```
-
-**Production**: Enabled (page on-call)
-
----
-
-## Structured Logging
-
-### Format
-
-**Standard**: JSON format with `extra` fields.
+The first 10 errors of each type (`parse_errors`, `callback_errors`) are
+logged with `logger.exception()`, which includes the full stack trace. This
+provides detailed diagnostics for initial debugging.
 
 ```python
-import logging
-import json
+# From infra/settrade_adapter.py
+_LOG_FIRST_N: int = 10
 
-class JSONFormatter(logging.Formatter):
-    def format(self, record):
-        log_data = {
-            "timestamp": self.formatTime(record),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        
-        # Add extra fields
-        if hasattr(record, "extra"):
-            log_data.update(record.extra)
-        
-        return json.dumps(log_data)
-
-# Configure
-handler = logging.StreamHandler()
-handler.setFormatter(JSONFormatter())
-
-logger = logging.getLogger(__name__)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-```
-
----
-
-### Example Output
-
-```json
-{
-  "timestamp": "2025-02-14T14:13:20.123Z",
-  "level": "WARNING",
-  "logger": "core.dispatcher",
-  "message": "Dispatcher overflow",
-  "queue_size": 9850,
-  "maxsize": 10000,
-  "overflow_count": 1543
-}
-```
-
----
-
-## What to Log
-
-### MQTT Events
-
-**Connection**:
-```python
-logger.info("MQTT connected", extra={"broker": broker, "client_id": client_id})
-```
-
-**Disconnection**:
-```python
-logger.warning("MQTT disconnected", extra={"reason_code": rc})
-```
-
-**Reconnection**:
-```python
-logger.info("MQTT reconnecting", extra={"attempt": attempt, "max_retries": max_retries})
-```
-
-**Subscription**:
-```python
-logger.info("Subscribed to symbol", extra={"symbol": symbol, "topic": topic})
-```
-
----
-
-### Dispatcher Events
-
-**Overflow**:
-```python
-logger.warning(
-    "Dispatcher overflow",
-    extra={
-        "queue_size": dispatcher._queue.qsize(),
-        "maxsize": dispatcher._maxsize,
-        "overflow_count": dispatcher._overflow_count,
-    }
-)
-```
-
-**Queue fill warning**:
-```python
-fill_ratio = dispatcher._queue.qsize() / dispatcher._maxsize
-if fill_ratio > 0.8:
-    logger.warning(
-        "Queue filling up",
-        extra={
-            "fill_ratio": fill_ratio,
-            "queue_size": dispatcher._queue.qsize(),
-            "maxsize": dispatcher._maxsize,
-        }
+if count <= _LOG_FIRST_N:
+    logger.exception(
+        "Failed to parse BidOfferV3 on %s (%d/%d)",
+        topic, count, _LOG_FIRST_N,
     )
 ```
 
----
+### Tier 2: Every 1000th Error (Summary Only)
 
-### Feed Health Events
+After the first 10 errors, only every 1000th occurrence is logged at
+`logger.error()` level (no stack trace). This keeps the log volume bounded
+while still providing ongoing visibility.
 
-**Feed stale**:
 ```python
-if not feed_health.is_alive():
-    logger.error("Feed is stale", extra={"global_timeout": global_timeout})
-```
+_LOG_EVERY_N: int = 1000
 
-**Symbol stale**:
-```python
-if not feed_health.is_symbol_alive(symbol):
-    logger.warning("Symbol is stale", extra={"symbol": symbol, "symbol_timeout": symbol_timeout})
-```
-
----
-
-### Adapter Events
-
-**Parse error**:
-```python
-try:
-    message = BestBidAskMessage.FromString(payload)
-except Exception as e:
+elif count % _LOG_EVERY_N == 0:
     logger.error(
-        "Failed to parse message",
-        extra={
-            "topic": topic,
-            "payload_size": len(payload),
-            "error": str(e),
-        }
+        "Parse errors ongoing: %d total (topic=%s)",
+        count, topic,
     )
 ```
 
-**Normalization error**:
+### Error Isolation
+
+Parse errors and callback errors have separate counters and separate logging
+methods (`_log_parse_error`, `_log_callback_error`). A parse failure does not
+increment the callback error counter, and vice versa.
+
+---
+
+## Dispatcher Logging
+
+The dispatcher logs at two key points in the push path:
+
+### Drop Rate Warning
+
+When the EMA-smoothed drop rate crosses the configured
+`drop_warning_threshold` (default 0.01 = 1%), a single warning is logged.
+The warning is not repeated until the rate recovers and crosses the threshold
+again.
+
 ```python
-try:
-    event = normalize_best_bid_ask(message)
-except Exception as e:
-    logger.error(
-        "Failed to normalize message",
-        extra={
-            "symbol": message.symbol,
-            "error": str(e),
-        }
+# From core/dispatcher.py
+if self._drop_rate_ema > self._drop_warning_threshold:
+    if not self._warned_drop_rate:
+        logger.warning(
+            "Drop rate EMA %.4f exceeds threshold %.4f",
+            self._drop_rate_ema, self._drop_warning_threshold,
+        )
+        self._warned_drop_rate = True
+```
+
+### Drop Rate Recovery
+
+When the EMA drops back below the threshold after a warning was issued, an
+info-level log records the recovery:
+
+```python
+elif self._warned_drop_rate:
+    logger.info(
+        "Drop rate EMA %.4f recovered below threshold %.4f",
+        self._drop_rate_ema, self._drop_warning_threshold,
     )
+    self._warned_drop_rate = False
 ```
+
+### Lifecycle Events
+
+- `Dispatcher created with maxlen=%d` -- INFO at construction
+- `Dispatcher clearing %d remaining events` -- WARNING when `clear()` discards events
+- `Dispatcher cleared: queue and counters reset` -- INFO after `clear()`
 
 ---
 
-## What NOT to Log
+## Transport (MQTT) Logging
 
-### ❌ High-Frequency Events
+### Connection Events
 
-**Don't log every event** (creates excessive volume):
-```python
-# ❌ BAD: Logs 1000+ times per second
-for event in dispatcher.poll():
-    logger.debug(f"Processing event: {event}")  # TOO MUCH
-    process_event(event)
-```
+- `Authenticated with Settrade API (broker=%s)` -- INFO after successful login
+- `Fetched MQTT host: %s` -- INFO after dispatcher token fetch
+- `MQTT client started, connecting to %s:%d` -- INFO at initial connect
+- `Connected to MQTT broker at %s` -- INFO on successful `on_connect`
+- `Replayed subscription: %s` -- INFO for each topic replayed on reconnect
+- `Reconnect epoch incremented to %d` -- INFO after reconnect subscription replay
 
-**Instead**: Log summary metrics periodically:
-```python
-# ✅ GOOD: Log every 1000 events
-event_count = 0
-for event in dispatcher.poll():
-    event_count += 1
-    if event_count % 1000 == 0:
-        logger.info("Processed events", extra={"count": event_count})
-    process_event(event)
-```
+### Disconnection Events
 
----
+- `Disconnected from MQTT broker (clean)` -- INFO for clean disconnect (rc=0)
+- `Unexpected MQTT disconnect (rc=%d)` -- WARNING for unexpected disconnect
 
-### ❌ Sensitive Data
+### Reconnection Events
 
-**Don't log credentials or tokens**:
-```python
-# ❌ BAD: Logs API token
-logger.info("Connecting to MQTT", extra={"token": api_token})
+- `Reconnect attempt (delay=%.1fs)` -- INFO at each reconnect attempt
+- `Reconnect TCP success (total=%d, gen=%d)` -- INFO on successful TCP reconnect
+- `Reconnect attempt failed` -- logged with `logger.exception()` (full trace)
 
-# ✅ GOOD: Log without token
-logger.info("Connecting to MQTT", extra={"broker": broker})
-```
+### Token Refresh
 
----
+- `Token near expiry, triggering controlled reconnect` -- INFO when refresh is needed
 
-### ❌ Personal Data
+### Shutdown Summary
 
-**Don't log PII** (personal identifiable information):
-```python
-# ❌ BAD: Logs user details
-logger.info("User transaction", extra={"user_id": user_id, "amount": amount})
+- `Shutting down MQTT client` -- INFO at shutdown start
+- `MQTT client shut down (messages=%d, errors=%d, reconnects=%d)` -- INFO summary at shutdown with lifetime counters
 
-# ✅ GOOD: Hash or omit PII
-logger.info("Transaction", extra={"hashed_user": hash(user_id), "amount": amount})
-```
+### Subscription Events
+
+- `Subscribed to topic: %s` -- INFO when MQTT subscribe is sent
+- `Unsubscribed from topic: %s` -- INFO when MQTT unsubscribe is sent
 
 ---
 
-## Logging Configuration
+## Adapter Logging
 
-### Python logging
-
-```python
-import logging
-import sys
-
-# Configure root logger
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),  # Console output
-        logging.FileHandler("feed_adapter.log"),  # File output
-    ]
-)
-
-# Module-specific logger
-logger = logging.getLogger(__name__)
-
-# Example usage
-logger.info("System started", extra={"version": "1.0.0"})
-```
+- `BidOfferAdapter subscribed to %s` -- INFO on symbol subscription
+- `BidOfferAdapter unsubscribed from %s` -- INFO on symbol unsubscription
+- `BidOfferAdapter already subscribed to %s, skipping` -- DEBUG for duplicate subscription
 
 ---
 
-### Production Configuration
+## Logger Names
 
-**Structured JSON logging**:
-```python
-import logging
-import json
-import sys
+Each module uses `logging.getLogger(__name__)`, producing these logger names:
 
-class JSONFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "timestamp": self.formatTime(record),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            **getattr(record, "__dict__", {}),  # Extra fields
-        })
-
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(JSONFormatter())
-
-logging.root.addHandler(handler)
-logging.root.setLevel(logging.INFO)
-```
-
-**Environment-based level**:
-```python
-import os
-
-log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.root.setLevel(getattr(logging, log_level))
-```
+| Logger Name | Module |
+| --- | --- |
+| `core.dispatcher` | Dispatcher queue and EMA |
+| `infra.settrade_mqtt` | MQTT transport, reconnect, token refresh |
+| `infra.settrade_adapter` | BidOffer adapter, parse/callback errors |
 
 ---
 
-## Log Rotation
-
-### File-based logging with rotation
+## Configuration Recommendations
 
 ```python
 import logging
-from logging.handlers import RotatingFileHandler
 
-handler = RotatingFileHandler(
-    "feed_adapter.log",
-    maxBytes=100 * 1024 * 1024,  # 100 MB
-    backupCount=5,  # Keep 5 old files
-)
+# See all feed adapter logs
+logging.basicConfig(level=logging.INFO)
 
-handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+# Silence dispatcher EMA warnings during testing
+logging.getLogger("core.dispatcher").setLevel(logging.ERROR)
 
-logger = logging.getLogger(__name__)
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+# Debug MQTT connection issues
+logging.getLogger("infra.settrade_mqtt").setLevel(logging.DEBUG)
 ```
 
 ---
 
-## External Logging Systems
+## Related Pages
 
-### Elasticsearch + Kibana
-
-**Ship logs to Elasticsearch**:
-```python
-from cmreslogging.handlers import CMRESHandler
-
-handler = CMRESHandler(
-    hosts=[{"host": "elasticsearch.local", "port": 9200}],
-    auth_type=CMRESHandler.AuthType.NO_AUTH,
-    es_index_name="feed-adapter",
-)
-
-logger = logging.getLogger(__name__)
-logger.addHandler(handler)
-```
-
----
-
-### CloudWatch Logs (AWS)
-
-```python
-import watchtower
-
-handler = watchtower.CloudWatchLogHandler(
-    log_group="feed-adapter",
-    stream_name="production",
-)
-
-logger = logging.getLogger(__name__)
-logger.addHandler(handler)
-```
-
----
-
-## Implementation Reference
-
-See:
-- [core/dispatcher.py](../../core/dispatcher.py) — Dispatcher logging
-- [core/feed_health.py](../../core/feed_health.py) — Feed health logging
-- [infra/settrade_mqtt.py](../../infra/settrade_mqtt.py) — MQTT logging
-
----
-
-## Next Steps
-
-- **[Metrics Reference](./metrics_reference.md)** — All metrics
-- **[Benchmark Guide](./benchmark_guide.md)** — Performance measurement
-- **[Performance Targets](./performance_targets.md)** — Target latencies
+- [Metrics Reference](./metrics_reference.md) -- numeric counters and gauges
+- [Failure Playbook](../09_production_guide/failure_playbook.md) -- interpreting error logs

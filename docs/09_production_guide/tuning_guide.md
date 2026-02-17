@@ -1,530 +1,217 @@
 # Tuning Guide
 
-Performance optimization and system tuning for production.
+Parameter optimization for production deployments.
 
 ---
 
 ## Overview
 
-This guide covers:
-- ✅ Queue sizing strategies
-- ✅ Timeout configuration
-- ✅ Thread tuning
-- ✅ Memory optimization
-- ✅ OS-level tuning
+This guide covers the key tunable parameters across all components and
+provides formulas and recommendations for production sizing.
 
 ---
 
-## Queue Tuning
+## Dispatcher: maxlen
+
+**Source:** `core/dispatcher.py` -- `DispatcherConfig.maxlen`
+
+**Default:** `100_000`
+
+**Constraint:** Must be > 0
 
 ### Sizing Formula
 
-**Formula**:
-```
-maxsize = peak_message_rate × max_consumer_latency × safety_factor
-```
-
-**Example**:
-- Peak rate: 100,000 events/sec (market open)
-- Max consumer latency: 0.5 sec (processing time)
-- Safety factor: 20x (handle bursts)
-
-```
-maxsize = 100,000 × 0.5 × 20 = 1,000,000
+```text
+maxlen = peak_rate * max_processing_time * safety_factor
 ```
 
-**Memory impact**:
-- BestBidAsk: 1,000,000 × 200 bytes = 200 MB
-- FullBidOffer: 1,000,000 × 440 bytes = 440 MB
+Where:
+
+- `peak_rate` = peak messages per second (e.g., 10,000 msg/s during market open)
+- `max_processing_time` = worst-case time for your strategy to process a batch (e.g., 5 seconds during a full portfolio rebalance)
+- `safety_factor` = headroom multiplier (recommend 2x)
+
+### Example
+
+```text
+peak_rate = 10,000 msg/s
+max_processing_time = 5 seconds
+safety_factor = 2
+
+maxlen = 10,000 * 5 * 2 = 100,000
+```
+
+### Trade-offs
+
+| maxlen | Memory | Drop Risk | Latency Impact |
+| --- | --- | --- | --- |
+| Small (1,000) | Low | High -- drops during brief stalls | Events always fresh |
+| Default (100,000) | Moderate (~10MB for BestBidAsk) | Low for most strategies | May process slightly stale data during bursts |
+| Large (1,000,000) | High (~100MB) | Very low | Risk of processing very stale data if consumer is slow |
 
 ---
 
-### Undersized Queue Symptoms
+## Dispatcher: EMA Alpha
 
-**Indicators**:
-- Frequent overflow errors in logs
-- High overflow count (`dispatcher._overflow_count`)
-- Events dropped even when consumer is processing
-- `queue.Full` exceptions
+**Source:** `core/dispatcher.py` -- `DispatcherConfig.ema_alpha`
 
-**Solution**: Increase `maxsize`
+**Default:** `0.01`
+
+**Constraint:** `0 < ema_alpha <= 1`
+
+The EMA smoothing factor controls how quickly the drop rate signal responds
+to changes. The half-life in messages is approximately `ln(2) / alpha`.
+
+| Alpha | Half-Life (messages) | Behavior |
+| --- | --- | --- |
+| `0.001` | ~693 | Very smooth; slow to detect drop bursts |
+| `0.01` (default) | ~69 | Good balance of smoothness and responsiveness |
+| `0.1` | ~7 | Fast reaction; noisy signal |
+| `1.0` | 1 | No smoothing; raw drop indicator |
+
+### When to Adjust
+
+- **Lower alpha** (e.g., 0.001) if you see false-positive drop warnings from brief transient bursts
+- **Higher alpha** (e.g., 0.05) if you need faster detection of sustained drop episodes
+
+---
+
+## Dispatcher: drop_warning_threshold
+
+**Source:** `core/dispatcher.py` -- `DispatcherConfig.drop_warning_threshold`
+
+**Default:** `0.01` (1%)
+
+**Constraint:** `0 < drop_warning_threshold <= 1`
+
+When the EMA drop rate exceeds this threshold, a warning is logged. When it
+recovers below, an info-level recovery is logged.
+
+| Threshold | Meaning |
+| --- | --- |
+| `0.001` (0.1%) | Very strict -- warns on rare drops |
+| `0.01` (1%, default) | Warns when ~1% of pushes are dropping |
+| `0.05` (5%) | Relaxed -- only warns on significant overflow |
+
+---
+
+## Feed Health: max_gap_seconds
+
+**Source:** `core/feed_health.py` -- `FeedHealthConfig.max_gap_seconds`
+
+**Default:** `5.0`
+
+**Constraint:** Must be > 0
+
+### Recommendations
+
+| Market Condition | Recommended Value |
+| --- | --- |
+| Active trading hours, liquid symbols | 5.0 seconds |
+| Pre-market / after-hours | 30.0 seconds |
+| Illiquid symbols | Use `per_symbol_max_gap` override |
+
+### Per-Symbol Override
+
+For symbols with different activity patterns, use `per_symbol_max_gap`:
 
 ```python
-# Before (too small)
-dispatcher = Dispatcher(maxsize=1000)
-
-# After (larger buffer)
-dispatcher = Dispatcher(maxsize=10000)
-```
-
----
-
-### Oversized Queue Symptoms
-
-**Indicators**:
-- High memory usage (> 500 MB for queue alone)
-- Long processing delays (events stale before consumed)
-- Consumer cannot keep up even with large buffer
-- Latency > 1 second end-to-end
-
-**Solution**: Decrease `maxsize` or optimize consumer
-
-```python
-# Before (too large, wastes memory)
-dispatcher = Dispatcher(maxsize=1000000)
-
-# After (right-sized)
-dispatcher = Dispatcher(maxsize=50000)
-```
-
----
-
-## Timeout Tuning
-
-### Global Feed Timeout
-
-**Parameter**: `global_timeout_sec`
-
-**Purpose**: Detect when **entire feed** is stalled.
-
-**Formula**:
-```
-global_timeout_sec ≈ 2-3 × expected_message_interval
-```
-
-**Example**:
-- Expected interval: ~0.01 sec (100 msg/sec)
-- Timeout: 2-3 × 0.01 = ~0.02-0.03 sec (20-30 ms)
-
-**Too short**: False alarms during normal gaps
-
-**Too long**: Slow detection of connection issues
-
-**Recommendations**:
-- **Real-time feed** (100+ msg/sec): 5-10 sec
-- **Low-volume feed** (< 10 msg/sec): 30-60 sec
-
-```python
-# High-frequency feed
-feed_health = FeedHealth(global_timeout_sec=5.0)
-
-# Low-frequency feed
-feed_health = FeedHealth(global_timeout_sec=30.0)
-```
-
----
-
-### Symbol-Specific Timeout
-
-**Parameter**: `symbol_timeout_sec`
-
-**Purpose**: Detect when **specific symbol** stops updating.
-
-**Formula**:
-```
-symbol_timeout_sec ≈ 5 × expected_symbol_update_interval
-```
-
-**Example**:
-- Liquid symbol (AOT): ~0.1 sec between updates
-- Timeout: 5 × 0.1 = 0.5 sec
-
-- Illiquid symbol: ~10 sec between updates
-- Timeout: 5 × 10 = 50 sec
-
-**Recommendations**:
-- **Liquid symbols**: 10 sec
-- **Illiquid symbols**: 60 sec
-- **After-hours**: 120 sec
-
-```python
-# Liquid symbols (intraday)
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-# Illiquid symbols / after-hours
-feed_health = FeedHealth(symbol_timeout_sec=60.0)
-```
-
----
-
-### MQTT Reconnect Timeout
-
-**Parameter**: Backoff exponential parameters
-
-**Current**: 1s base, 2x multiplier, 5 max retries
-
-```python
-# In SettradeMQTTClient
-base_delay = 1.0  # sec
-max_retries = 5
-multiplier = 2
-
-# Retry schedule: 1s, 2s, 4s, 8s, 16s
-```
-
-**Tuning**:
-- **Faster reconnect**: Decrease base_delay (e.g., 0.5s)
-- **More attempts**: Increase max_retries (e.g., 10)
-- **Aggressive backoff**: Increase multiplier (e.g., 3)
-
-**Trade-off**: Faster reconnect vs server load
-
----
-
-## Thread Tuning
-
-### Consumer Thread Count
-
-**Formula**:
-```
-thread_count = min(CPU_cores, messages_per_sec / per_thread_capacity)
-```
-
-**Example**:
-- CPU cores: 8
-- Message rate: 100,000 msg/sec
-- Per-thread capacity: 50,000 msg/sec
-
-```
-thread_count = min(8, 100,000 / 50,000) = min(8, 2) = 2
-```
-
-**Recommendations**:
-- **Low load** (< 50k msg/sec): 1 thread
-- **Medium load** (50k-150k msg/sec): 2-4 threads
-- **High load** (> 150k msg/sec): 4-8 threads
-
-**Diminishing returns**: GIL contention above 4-8 threads
-
----
-
-### MQTT Callback Thread
-
-**Policy**: Single-threaded (paho-mqtt design)
-
-**Tuning**: Minimize work in callback
-
-```python
-def on_message(client, userdata, msg):
-    # ✅ FAST: Just enqueue
-    dispatcher.put_if_fits(event)
-    
-    # ❌ SLOW: Don't process here
-    # process_event(event)  # Blocks MQTT thread!
-```
-
----
-
-## Memory Optimization
-
-### Event Object Recycling
-
-**Problem**: High allocation rate (100k+ events/sec)
-
-**Solution**: Object pool (advanced, not currently implemented)
-
-```python
-from queue import Queue
-
-class EventPool:
-    def __init__(self, size: int):
-        self.pool: Queue[BestBidAsk] = Queue(maxsize=size)
-        
-        # Pre-allocate objects
-        for _ in range(size):
-            self.pool.put(BestBidAsk.model_construct(...))
-    
-    def acquire(self) -> BestBidAsk:
-        try:
-            return self.pool.get_nowait()
-        except:
-            return BestBidAsk.model_construct(...)  # Fallback
-    
-    def release(self, event: BestBidAsk):
-        try:
-            self.pool.put_nowait(event)
-        except:
-            pass  # Pool full, let GC handle it
-```
-
-**Trade-off**: Complexity vs memory churn reduction
-
----
-
-### GC Tuning (CPython)
-
-**Problem**: GC pauses during high allocation rate
-
-**Solution**: Adjust GC thresholds
-
-```python
-import gc
-
-# Default thresholds: (700, 10, 10)
-gc.set_threshold(10000, 20, 20)  # Less frequent GC
-
-# Or disable GC during critical sections
-gc.disable()
-process_burst()
-gc.enable()
-```
-
-**Trade-off**: Memory usage vs GC pause frequency
-
----
-
-### Tuple vs List for FullBidOffer
-
-**Current**: Uses tuples (immutable)
-
-**Alternative**: lists (mutable)
-
-**Benchmark**:
-- Tuple creation: ~faster~ (C-level optimization)
-- List creation: Slightly slower
-
-**Verdict**: Keep tuples (immutable + hashable benefits)
-
----
-
-## OS-Level Tuning (Linux)
-
-### CPU Frequency Scaling
-
-**Problem**: CPU governor throttles performance
-
-**Solution**: Set to performance mode
-
-```bash
-# Check current governor
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Set to performance (requires root)
-sudo cpupower frequency-set -g performance
-
-# Verify
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-```
-
-**Trade-off**: Power consumption vs performance
-
----
-
-### CPU Isolation (Real-time)
-
-**Problem**: Other processes interfere with feed adapter
-
-**Solution**: Isolate CPU cores
-
-```bash
-# Add to kernel boot parameters (/etc/default/grub)
-isolcpus=2,3  # Isolate cores 2-3
-
-# Then pin feed adapter to isolated cores
-taskset -c 2,3 python main.py
-```
-
-**Trade-off**: Resource dedication vs flexibility
-
----
-
-### Network Tuning
-
-**Problem**: Network buffer sizes too small
-
-**Solution**: Increase TCP buffer sizes
-
-```bash
-# Increase receive buffer (requires root)
-sudo sysctl -w net.core.rmem_max=16777216
-sudo sysctl -w net.core.rmem_default=262144
-
-# Increase send buffer
-sudo sysctl -w net.core.wmem_max=16777216
-sudo sysctl -w net.core.wmem_default=262144
-
-# Make permanent
-sudo sysctl -p
-```
-
----
-
-### File Descriptor Limits
-
-**Problem**: Too many connections → "Too many open files"
-
-**Solution**: Increase limits
-
-```bash
-# Check current limit
-ulimit -n
-
-# Increase (temporary)
-ulimit -n 65536
-
-# Permanent: Edit /etc/security/limits.conf
-* soft nofile 65536
-* hard nofile 65536
-```
-
----
-
-## Python-Specific Tuning
-
-### Disable Assertions
-
-**Problem**: Debug assertions in production
-
-**Solution**: Run with `-O` (optimize)
-
-```bash
-# Normal (assertions enabled)
-python main.py
-
-# Optimized (assertions disabled)
-python -O main.py
-
-# More aggressive (remove docstrings too)
-python -OO main.py
-```
-
-**Speedup**: ~5-10% for assertion-heavy code
-
----
-
-### Use PyPy (Alternative)
-
-**Problem**: CPython GIL limits parallelism
-
-**Solution**: Try PyPy (JIT compiler, no GIL in some cases)
-
-**Note**: Not all dependencies work with PyPy (betterproto, pydantic)
-
-**Verdict**: Stick with CPython for now
-
----
-
-## Configuration Examples
-
-### Low-Latency Configuration
-
-**Goal**: Minimize latency (< 10 µs end-to-end)
-
-```python
-from core.dispatcher import Dispatcher
-from core.feed_health import FeedHealth
-
-# Small queue (low buffering)
-dispatcher = Dispatcher(maxsize=1000)
-
-# Short timeouts (fast failure detection)
-feed_health = FeedHealth(
-    global_timeout_sec=5.0,
-    symbol_timeout_sec=10.0,
+config = FeedHealthConfig(
+    max_gap_seconds=5.0,          # global default
+    per_symbol_max_gap={
+        "RARE": 60.0,             # illiquid -- 60s threshold
+        "ILLIQUID": 30.0,         # low volume -- 30s threshold
+    },
 )
+```
 
-# Single consumer thread (no context switching)
-def consumer():
-    for event in dispatcher.poll(timeout=0.001):  # 1ms timeout
-        process_event(event)
+Symbols not in the override dictionary use the global `max_gap_seconds`.
+
+---
+
+## MQTT: Reconnect Delays
+
+**Source:** `infra/settrade_mqtt.py` -- `MQTTClientConfig`
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `reconnect_min_delay` | `1.0` | Minimum backoff delay in seconds |
+| `reconnect_max_delay` | `30.0` | Maximum backoff delay in seconds |
+| `token_refresh_before_exp_seconds` | `100` | Seconds before token expiry to trigger controlled reconnect |
+
+### Reconnect Trade-offs
+
+- **Lower min_delay** (e.g., 0.5s): Faster reconnect after brief outages, but higher broker load during sustained outages
+- **Higher max_delay** (e.g., 60s): Reduced broker load during sustained outages, but longer recovery time
+- **Higher token_refresh_before_exp_seconds** (e.g., 300s): More time margin for token refresh, but more frequent reconnects
+
+### Backoff Behavior
+
+The reconnect loop doubles the delay on each failure:
+
+```text
+attempt 1: 1.0s * jitter(0.8-1.2) = ~0.8-1.2s
+attempt 2: 2.0s * jitter          = ~1.6-2.4s
+attempt 3: 4.0s * jitter          = ~3.2-4.8s
+...
+attempt N: min(delay * 2^N, max_delay) * jitter
 ```
 
 ---
 
-### High-Throughput Configuration
+## MQTT: Keepalive
 
-**Goal**: Maximize throughput (> 150k events/sec)
+**Source:** `infra/settrade_mqtt.py` -- `MQTTClientConfig.keepalive`
 
-```python
-# Large queue (buffer bursts)
-dispatcher = Dispatcher(maxsize=100000)
+**Default:** `30` seconds
 
-# Longer timeouts (tolerate gaps)
-feed_health = FeedHealth(
-    global_timeout_sec=10.0,
-    symbol_timeout_sec=30.0,
-)
+**Constraint:** 5 to 300 seconds
 
-# Multiple consumer threads
-import threading
-
-def consumer():
-    for event in dispatcher.poll(timeout=0.1):  # 100ms timeout
-        process_event(event)
-
-threads = [threading.Thread(target=consumer, daemon=True) for _ in range(4)]
-for t in threads:
-    t.start()
-```
+Lower values detect dead connections faster but generate more network traffic.
+The default of 30 seconds is appropriate for most deployments.
 
 ---
 
-### Memory-Constrained Configuration
+## Poll Batch Size (max_events)
 
-**Goal**: Minimize memory usage (< 50 MB)
+**Source:** `core/dispatcher.py` -- `Dispatcher.poll(max_events)`
 
-```python
-# Small queue (low memory)
-dispatcher = Dispatcher(maxsize=5000)
+**Default:** `100`
 
-# Filter symbols (reduce subscriptions)
-TRACKED_SYMBOLS = ["AOT", "PTT", "CPALL"]  # Only 3 symbols
-client.subscribe_to_symbols(TRACKED_SYMBOLS)
+The `max_events` parameter on `poll()` controls how many events are consumed
+per call.
 
-# Disable GC during critical sections
-import gc
-gc.disable()
-```
+| Batch Size | Throughput | Per-Event Latency |
+| --- | --- | --- |
+| Small (1-10) | Lower | Lower -- each event processed immediately |
+| Medium (50-100, default) | Good balance | Good balance |
+| Large (500-1000) | Higher -- amortizes call overhead | Higher -- batch must complete before next poll |
 
----
+### Batch Size Trade-offs
 
-## Monitoring Tuning Effectiveness
-
-### Before Tuning
-
-```bash
-# Baseline metrics
-uv run python scripts/benchmark_adapter.py > before.txt
-```
-
-### Apply Tuning
-
-```python
-# Modify configuration
-dispatcher = Dispatcher(maxsize=50000)  # Changed from 10000
-```
-
-### After Tuning
-
-```bash
-# New metrics
-uv run python scripts/benchmark_adapter.py > after.txt
-
-# Compare
-diff before.txt after.txt
-```
-
-### Metrics to Track
-
-- **Latency**: p50, p99 (lower is better)
-- **Throughput**: events/sec (higher is better)
-- **Memory**: RSS (lower is better)
-- **CPU**: % utilization (lower is better)
-- **Overflow**: count (should be 0)
+- **Smaller batches** for latency-sensitive strategies that need to react to each event quickly
+- **Larger batches** for throughput-oriented strategies that process events in bulk
 
 ---
 
-## Implementation Reference
+## Adapter: full_depth
 
-See:
-- [core/dispatcher.py](../../core/dispatcher.py) — Queue configuration
-- [core/feed_health.py](../../core/feed_health.py) — Timeout configuration
-- [infra/settrade_mqtt.py](../../infra/settrade_mqtt.py) — Reconnect tuning
+**Source:** `infra/settrade_adapter.py` -- `BidOfferAdapterConfig.full_depth`
+
+**Default:** `False`
+
+| Mode | Event Type | Objects Per Message | Use Case |
+| --- | --- | --- | --- |
+| `False` (default) | `BestBidAsk` | Minimal | Low-latency strategies |
+| `True` | `FullBidOffer` | ~46 (4 tuples + 40 values) | Depth-of-book strategies |
+
+`FullBidOffer` creates significantly more GC pressure. Do not use for
+sub-100us latency strategies.
 
 ---
 
-## Next Steps
+## Related Pages
 
-- **[Deployment Checklist](./deployment_checklist.md)** — Pre-deployment verification
-- **[Failure Playbook](./failure_playbook.md)** — Troubleshooting guide
-- **[Performance Targets](../07_observability/performance_targets.md)** — Target metrics
+- [Deployment Checklist](./deployment_checklist.md) -- pre-launch verification
+- [Failure Playbook](./failure_playbook.md) -- troubleshooting
+- [Metrics Reference](../07_observability/metrics_reference.md) -- monitoring

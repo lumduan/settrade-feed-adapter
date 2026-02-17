@@ -1,21 +1,36 @@
 # Mental Model
 
-Understanding the conceptual model of settrade-feed-adapter.
+How to think about the settrade-feed-adapter pipeline, its invariants, and its failure modes.
 
 ---
 
-## The Big Picture
+## The Pipeline
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                      Conceptual Flow                          │
-└──────────────────────────────────────────────────────────────┘
+Every piece of market data flows through five stages:
 
-MQTT → Adapter → Event Model → Dispatcher → Strategy
-  ↑        ↑           ↑            ↑           ↑
-  │        │           │            │           │
-Phase 1  Phase 2    Phase 2      Phase 3    Your Code
+```text
+MQTT  ->  Adapter  ->  Event Model  ->  Dispatcher  ->  Strategy
 ```
+
+| Stage | Module | Thread | Responsibility |
+| --- | --- | --- | --- |
+| MQTT | `SettradeMQTTClient` | IO thread (paho) | WebSocket+TLS transport, reconnect, token refresh |
+| Adapter | `BidOfferAdapter` | IO thread (callback) | Parse protobuf, normalize, forward via `on_event` |
+| Event Model | `BestBidAsk` / `FullBidOffer` | (immutable data) | Typed, frozen Pydantic model with timestamps |
+| Dispatcher | `Dispatcher` | IO thread writes, strategy thread reads | Bounded `deque(maxlen)`, drop-oldest backpressure |
+| Strategy | Your code | Strategy thread | Poll events, make decisions |
+
+The adapter does not hold a reference to the dispatcher. Instead it accepts a callback (`on_event: Callable`) at construction time. The standard wiring is:
+
+```python
+adapter = BidOfferAdapter(
+    config=BidOfferAdapterConfig(),
+    mqtt_client=mqtt_client,
+    on_event=dispatcher.push,
+)
+```
+
+This decoupling means you can replace the dispatcher with any callable -- a list's `.append`, a logging function, or a custom queue -- without modifying the adapter.
 
 ---
 
@@ -23,250 +38,151 @@ Phase 1  Phase 2    Phase 2      Phase 3    Your Code
 
 ### 1. Transport Reliability
 
-**Goal**: Never lose connection without knowing about it.
+The MQTT client is a **self-healing connection**. When the network drops or the broker rejects a connection, it enters a reconnect loop with exponential backoff and jitter. When a token approaches expiry, it triggers a **controlled reconnect** -- disconnect, fetch fresh credentials, create an entirely new paho `mqtt.Client` instance, and reconnect. There is no live header mutation on an existing connection.
 
-**Mechanisms**:
-- **Auto-reconnect** with exponential backoff
-- **Token refresh** before expiration
-- **Generation counter** to reject stale messages
-- **Connection epoch** tracking in every event
+Each new client instance gets an incremented **generation ID**. Messages arriving from a stale client generation are silently rejected in `_on_message` before any callback runs.
 
-**Mental Model**: Think of the MQTT client as a **self-healing network pipe**.
+After a successful reconnect, the client replays all subscriptions from its internal source-of-truth dictionary. Only after replay completes does it increment the **reconnect epoch**. This means:
 
-```
-[Normal Operation]
-  Connected ───> Receiving messages ───> (network blip) ───> Auto-reconnect ───> Connected
+- Epoch 0 = the initial connection.
+- Epoch 1 = first reconnect, subscriptions replayed.
+- Epoch N = Nth reconnect.
 
-[Token Expiry]
-  Connected ───> Token near expiry ───> Proactive disconnect ───> Refresh token ───> Reconnect
-```
+Strategy code detects reconnects by comparing `event.connection_epoch` against the last-seen value.
 
 ### 2. Data Correctness
 
-**Goal**: Typed, validated events — no surprises.
+Parsing happens inline in the MQTT IO thread callback. The adapter calls `BidOfferV3().parse(payload)` (betterproto) to deserialize the binary protobuf, then converts prices from the protobuf `Money` type using inline arithmetic:
 
-**Mechanisms**:
-- **Pydantic models** for strong typing
-- **Input validation** and normalization
-- **Direct protobuf access** (no dict conversion)
-- **Float precision contract** for price comparisons
-
-**Mental Model**: Think of events as **immutable data packets with guarantees**.
-
-```
-Raw Binary Protobuf
-      ↓
-Betterproto Parse (validates structure)
-      ↓
-Normalization (uppercase symbol, validate ranges)
-      ↓
-Pydantic Model Construction (typed, frozen, hashable)
-      ↓
-BestBidAsk Event (ready for strategy)
+```python
+bid = msg.bid_price1.units + msg.bid_price1.nanos * 1e-9
 ```
 
-**Key Guarantee**: If you receive a `BestBidAsk` event, it is **structurally valid** and passed normalization.
+No `Decimal` allocation, no `.to_dict()` roundtrip, no `getattr` loops. The result is a `BestBidAsk` (or `FullBidOffer`) built via `model_construct()`, which skips Pydantic validation entirely. This is the hot-path optimization -- validation is bypassed because the protobuf schema guarantees structural correctness.
+
+When `model_construct()` is used, `bid_flag` and `ask_flag` are stored as plain `int` rather than `BidAskFlag` enum instances. This is safe because `IntEnum` comparison works with raw integers (`2 in (BidAskFlag.ATO, BidAskFlag.ATC)` is `True`).
+
+Prices are IEEE 754 `float` with 15-17 significant digits. Strategy code must compare prices with tolerance (`abs(a - b) < 1e-9`), never with `==`.
 
 ### 3. Delivery Control
 
-**Goal**: Predictable backpressure — no hidden buffering.
+The dispatcher wraps `collections.deque(maxlen)`. When the deque is full:
 
-**Mechanisms**:
-- **Bounded queue** with explicit maxlen
-- **Drop-oldest policy** (stale data is worthless)
-- **Visible overflow metrics** (exact drop count)
-- **Batch polling** from strategy thread
+1. `push()` checks `len(queue) == maxlen` (pre-append length check).
+2. If full, increments `_total_dropped`.
+3. `queue.append(event)` executes -- the deque contract automatically evicts the oldest item.
+4. Increments `_total_pushed`.
 
-**Mental Model**: Think of the dispatcher as a **bounded conveyor belt**.
+The backpressure policy is **drop-oldest**. Stale market data is worthless; new data always wins.
 
-```
-Producer (MQTT thread)          Consumer (Strategy thread)
-       ↓                                ↑
-   [Push Event]                    [Poll Batch]
-       ↓                                ↑
- ┌─────────────────────────────────────┐
- │  Bounded Queue (maxlen=100K)        │
- │  [Event1][Event2][Event3]...[EventN]│
- └─────────────────────────────────────┘
-       ↓ (Queue Full)
-   [Drop Oldest]
-   _total_dropped++
+The consumer calls `poll(max_events)` which pops up to `max_events` items from the left (FIFO order) and increments `_total_polled` by the count returned.
+
+The fundamental accounting invariant is:
+
+```text
+total_pushed - total_dropped - total_polled == queue_len
 ```
 
-**Key Guarantee**: If the queue overflows, you **know exactly how many events were dropped**.
+This holds exactly under quiescent conditions (no concurrent push/poll). Under concurrent access, all counters are individually atomic (CPython GIL), but the combination is eventually consistent -- reads may reflect slightly different points in time.
 
 ---
 
 ## Threading Model
 
-### Single Producer, Single Consumer (SPSC)
+The system uses exactly two threads for the data path:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Main Thread (Your Strategy)                                │
-│  ├─ dispatcher.poll() → batch of events                     │
-│  ├─ Process events                                          │
-│  └─ Loop                                                    │
-└─────────────────────────────────────────────────────────────┘
-                          ↑
-                          │ (thread-safe deque)
-                          │
-┌─────────────────────────────────────────────────────────────┐
-│  MQTT IO Thread (paho-mqtt loop)                            │
-│  ├─ Receive binary message                                  │
-│  ├─ on_message callback (inline)                            │
-│  │   ├─ Parse protobuf                                      │
-│  │   ├─ Normalize → BestBidAsk                              │
-│  │   └─ dispatcher.push(event)                              │
-│  └─ Loop                                                    │
-└─────────────────────────────────────────────────────────────┘
+```text
+MQTT IO Thread (paho loop_start)       Strategy Thread (your code)
+-------------------------------        ---------------------------
+on_message callback fires              dispatcher.poll(max_events)
+  -> BidOfferAdapter._on_message         -> popleft up to N items
+    -> parse protobuf                    -> _total_polled += len
+    -> model_construct()                 -> process events
+    -> on_event(event)                   -> monitor.on_event(...)
+      -> dispatcher.push(event)          -> check health signals
+        -> _queue.append(event)
+        -> _total_pushed += 1
 ```
 
-**Key Insight**: Only **one synchronization point** — the bounded queue.
+The synchronization point is the `deque`. CPython's GIL guarantees that `deque.append()` and `deque.popleft()` are atomic (single bytecode instruction each). No explicit locks are used in the push/poll hot path.
+
+This is a **strictly SPSC** (single-producer, single-consumer) design:
+
+- `push()` is called only from the MQTT IO thread.
+- `poll()` is called only from the strategy thread.
+- `_total_pushed` and `_total_dropped` are written only by the push thread.
+- `_total_polled` is written only by the poll thread.
+- No two threads ever write to the same counter.
+
+If you need multi-producer or multi-consumer, replace `deque` with `threading.Queue` or add explicit locking. The current design is not safe on PyPy, GraalPy, or nogil Python.
 
 ---
 
 ## Error Isolation
 
-Errors are **isolated** at each layer and **counted separately**.
+Parse errors and callback errors are tracked in **separate counters**. Each message increments exactly one of three outcomes:
 
-### Parse Errors (Phase 2)
+| Outcome | Counter incremented | What happened |
+| --- | --- | --- |
+| Full success | `_messages_parsed` | Protobuf parsed and callback completed |
+| Parse failure | `_parse_errors` | `BidOfferV3().parse()` raised an exception |
+| Callback failure | `_callback_errors` | `on_event(event)` raised an exception |
 
-```
-Binary Payload → Parse Fails → Log + Counter++ → Continue
-```
+A protobuf parse failure does NOT increment `callback_errors`. A downstream callback failure does NOT increment `parse_errors`. This separation enables precise production debugging -- you can immediately tell whether the problem is in deserialization or in the consumer.
 
-**Guarantee**: Parse error does **not** crash the adapter.
-
-### Callback Errors (Phase 1)
-
-```
-Message Arrives → Callback Raises → Log + Counter++ → Continue
-```
-
-**Guarantee**: Callback error does **not** crash the MQTT client.
-
-### Strategy Errors (Your Code)
-
-```
-Process Event → Strategy Raises → Your Error Handling
-```
-
-**Guarantee**: Strategy error does **not** affect the adapter.
+Error logging is rate-limited: the first 10 errors of each type include full stack traces. After that, only every 1000th error is logged to prevent log storms at high message rates.
 
 ---
 
-## State Machines
+## State Machine
 
-### MQTT Client State Machine
+The MQTT client moves through five states:
 
-```
-INIT
-  ↓ (connect())
-CONNECTING
-  ↓ (on_connect)
-CONNECTED
-  ↓ (on_disconnect, not shutdown)
-RECONNECTING
-  ↓ (reconnect_delay, reconnect())
-CONNECTING
-  ↓ (on_connect)
-CONNECTED
-  ↓ (shutdown())
-SHUTDOWN (terminal)
+```text
+INIT  ->  CONNECTING  ->  CONNECTED  ->  RECONNECTING  ->  CONNECTED  -> ...
+                                                                         |
+                                              (any state)  ->  SHUTDOWN
 ```
 
-**Key States**:
-- `RECONNECTING`: Background loop attempting reconnect
-- `SHUTDOWN`: Terminal state, no further reconnects
+| State | Meaning |
+| --- | --- |
+| `INIT` | Client created, `connect()` not yet called |
+| `CONNECTING` | Authentication done, MQTT TCP connect in progress |
+| `CONNECTED` | MQTT connected, `on_connect` fired with `rc=0`, subscriptions replayed |
+| `RECONNECTING` | Disconnected, background reconnect loop running with backoff |
+| `SHUTDOWN` | Terminal state after `shutdown()` -- no further reconnects |
 
-### Dispatcher Invariant
+Key design detail: the state transitions to `CONNECTED` only inside the `on_connect` callback (which runs in the IO thread), not when the TCP connect returns. TCP connect success does not guarantee MQTT-level authentication success. The `RECONNECTING` state persists until `on_connect` fires with `rc=0`.
 
-At all times:
-```
-total_pushed - total_dropped - total_polled == queue_len
-```
+The reconnect loop uses exponential backoff with jitter:
 
-This invariant is **eventually consistent** (lock-free reads), but holds exactly under quiescent conditions.
-
----
-
-## Data Flow Example
-
-Let's trace a single event:
-
-```
-1. Broker Sends BidOfferV3 Protobuf
-        ↓
-2. SettradeMQTTClient Receives (WSS)
-   client._on_message(client, userdata, msg)
-   recv_ts = time.time_ns()
-   recv_mono_ns = time.perf_counter_ns()
-        ↓
-3. BidOfferAdapter Parses
-   bid_offer_msg = BidOfferV3().parse(msg.payload)
-   symbol = bid_offer_msg.symbol.upper()
-   bid = bid_offer_msg.bid_price1.units + bid_offer_msg.bid_price1.nanos * 1e-9
-        ↓
-4. Normalize to BestBidAsk
-   event = BestBidAsk.model_construct(
-       symbol=symbol,
-       bid=bid,
-       ask=ask,
-       recv_ts=recv_ts,
-       recv_mono_ns=recv_mono_ns,
-       connection_epoch=client.connection_epoch,
-   )
-        ↓
-5. Dispatcher Pushes
-   dispatcher.push(event)
-   _total_pushed++
-   (if queue full: drop oldest, _total_dropped++)
-        ↓
-6. Strategy Polls
-   events = dispatcher.poll(max_events=100)
-   _total_polled += len(events)
-        ↓
-7. Strategy Processes
-   for event in events:
-       # Your logic here
-       pass
-```
-
----
-
-## Key Takeaways
-
-1. **Transport Reliability**: Self-healing MQTT connection with generation-based stale rejection
-2. **Data Correctness**: Typed, validated events with explicit normalization
-3. **Delivery Control**: Bounded queue with visible drop-oldest backpressure
-4. **Error Isolation**: Errors are counted and logged, never crash the pipeline
-5. **Threading Model**: SPSC — one producer (MQTT), one consumer (Strategy)
-6. **Observable**: Comprehensive metrics at every layer
+- Starts at `reconnect_min_delay` (default 1.0s).
+- Doubles on each failure up to `reconnect_max_delay` (default 30.0s).
+- Each delay is jittered by +/-20% to avoid thundering herd.
 
 ---
 
 ## Anti-Patterns to Avoid
 
-❌ **Don't block in your strategy loop**  
-   → Use async I/O or offload to worker threads
+**Do not block inside the poll loop.** Database writes, HTTP calls, or heavy computation in the poll loop will cause the dispatcher queue to fill up and start dropping events. Offload slow work to a separate worker thread.
 
-❌ **Don't ignore `connection_epoch` changes**  
-   → Clear state when reconnect detected
+**Do not ignore `connection_epoch` changes.** When the epoch increments, the MQTT client has reconnected and replayed subscriptions. Any cached order book state, pending order tracking, or derived signals from the old connection are now suspect. Clear and rebuild.
 
-❌ **Don't compare floats with `==`**  
-   → Use tolerance: `abs(a - b) < 1e-9`
+**Do not compare float prices with `==`.** Prices are IEEE 754 floats converted from protobuf `Money(units, nanos)`. Use tolerance comparisons: `abs(a - b) < 1e-9`.
 
-❌ **Don't assume zero drops**  
-   → Monitor `dispatcher.stats().total_dropped`
+**Do not assume zero drops.** Always monitor `dispatcher.stats().total_dropped`. A non-zero count means your strategy is not keeping up with the feed rate. Check `dispatcher.health().drop_rate_ema` for a smoothed signal.
 
-❌ **Don't ignore parse_errors**  
-   → Check `adapter.stats().parse_errors`
+**Do not ignore `parse_errors`.** Non-zero `adapter.stats()["parse_errors"]` means protobuf messages are arriving that the adapter cannot deserialize. This may indicate a schema version mismatch or corrupted payloads.
+
+**Do not call `push()` from multiple threads.** The dispatcher is strictly SPSC. Adding a second producer invalidates all lock-free safety guarantees. If you need multiple producers, switch to `threading.Queue`.
+
+**Do not call `dispatcher.clear()` while push/poll are active.** `clear()` resets all counters and empties the queue. It must be called from the main thread only, with the MQTT client disconnected or the adapter paused.
 
 ---
 
 ## Next Steps
 
-- **[System Overview](../01_system_overview/architecture.md)** — Architecture deep dive
-- **[Threading and Concurrency](../01_system_overview/threading_and_concurrency.md)** — Concurrency guarantees
-- **[Event Models](../04_event_models/event_contract.md)** — Event contracts
+- **[Quickstart](./quickstart.md)** -- Get running in 5 minutes
+- **[Architecture Overview](../01_system_overview/architecture.md)** -- Component-level deep dive
+- **[Threading and Concurrency](../01_system_overview/threading_and_concurrency.md)** -- Concurrency guarantees
+- **[Event Models](../04_event_models/event_contract.md)** -- Field semantics and type contracts

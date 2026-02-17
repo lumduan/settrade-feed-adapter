@@ -1,191 +1,204 @@
 # Event Contract
 
-Pydantic event model specifications and contracts.
+Pydantic model guarantees shared by `BestBidAsk` and `FullBidOffer`.
 
 ---
 
-## Overview
+## Model Configuration
 
-All events are **immutable Pydantic models** with these properties:
-- ✅ **Frozen** (`frozen=True`) — Cannot modify fields
-- ✅ **Hashable** — Can be used as dict keys or in sets
-- ✅ **Equatable** — Events with identical fields compare equal
-- ✅ **Validated** — Pydantic enforces types and constraints
-- ✅ **Strict** — Extra fields rejected (`extra='forbid'`)
-
----
-
-## Event Models
-
-### BestBidAsk
-Top-of-book (Level 1) market data.
-
-**Fields**:
-- `symbol: str` — Stock ticker (uppercase)
-- `bid: float` — Best bid price
-- `ask: float` — Best ask price
-- `bid_vol: int` — Best bid volume
-- `ask_vol: int` — Best ask volume
-- `bid_flag: int` — Bid session flag (1=NORMAL, 2=ATO, 3=ATC)
-- `ask_flag: int` — Ask session flag
-- `recv_ts: int` — Wall clock timestamp (nanoseconds)
-- `recv_mono_ns: int` — Monotonic timestamp (nanoseconds)
-- `connection_epoch: int` — Reconnect counter (default 0)
-
-### FullBidOffer
-Full 10-level order book (Level 2).
-
-**Fields**:
-- `symbol: str`
-- `bid_prices: tuple[float, ...]` — 10 bid prices
-- `ask_prices: tuple[float, ...]` — 10 ask prices
-- `bid_volumes: tuple[int, ...]` — 10 bid volumes
-- `ask_volumes: tuple[int, ...]` — 10 ask volumes
-- `bid_flag: int`
-- `ask_flag: int`
-- `recv_ts: int`
-- `recv_mono_ns: int`
-- `connection_epoch: int`
-
----
-
-## Model Contracts
-
-### Immutability
-
-**Contract**: All fields are frozen and cannot be modified.
+Both event models use the same Pydantic `ConfigDict`:
 
 ```python
-event = BestBidAsk(symbol="AOT", bid=25.5, ...)
-
-# ❌ Raises ValidationError
-event.bid = 26.0
+model_config = ConfigDict(frozen=True, extra="forbid")
 ```
 
-**Test**: `test_events.py::TestBestBidAsk::test_frozen_immutability`
+This yields four guarantees that strategy code can rely on.
 
----
+### Immutable (frozen=True)
 
-### Hashability
-
-**Contract**: Events can be used as dict keys or in sets.
+All fields are read-only after construction. Any attempt to assign a field
+raises a `ValidationError`:
 
 ```python
-event1 = BestBidAsk(...)
-event2 = BestBidAsk(...)
+event = BestBidAsk(symbol="AOT", bid=25.5, ask=26.0,
+                   bid_vol=1000, ask_vol=500,
+                   bid_flag=BidAskFlag.NORMAL, ask_flag=BidAskFlag.NORMAL,
+                   recv_ts=1739500000000000000, recv_mono_ns=123456789)
 
-# ✅ Works
-event_set = {event1, event2}
-event_dict = {event1: "data"}
+event.bid = 30.0   # raises ValidationError
 ```
 
-**Test**: `test_events.py::TestBestBidAsk::test_hashable`
+### Hashable
 
----
-
-### Equality
-
-**Contract**: Events with identical field values compare equal.
+Because the models are frozen, they are hashable. You can use events as
+dictionary keys or store them in sets:
 
 ```python
-event1 = BestBidAsk(symbol="AOT", bid=25.5, ...)
-event2 = BestBidAsk(symbol="AOT", bid=25.5, ...)
-
-assert event1 == event2  # ✅ True
+seen = set()
+seen.add(event)           # works
+cache = {event: result}   # works
 ```
 
-**Test**: `test_events.py::TestBestBidAsk::test_equality`
+### Equality by Value
+
+Two events with identical field values compare equal, regardless of whether
+they are the same Python object:
+
+```python
+a = BestBidAsk(symbol="AOT", bid=25.5, ...)
+b = BestBidAsk(symbol="AOT", bid=25.5, ...)
+assert a == b        # True
+assert a is not b    # different objects
+```
+
+### No Extra Fields (extra="forbid")
+
+Passing a field name that is not part of the schema raises a
+`ValidationError`. This protects against typos and schema drift:
+
+```python
+# raises ValidationError -- "spread" is not a valid field
+BestBidAsk(symbol="AOT", bid=25.5, ask=26.0, spread=0.5, ...)
+```
 
 ---
 
-### Extra Fields Rejected
-
-**Contract**: Cannot add unknown fields.
+## BidAskFlag Enum
 
 ```python
-# ❌ Raises ValidationError
+class BidAskFlag(IntEnum):
+    UNDEFINED = 0
+    NORMAL    = 1
+    ATO       = 2   # At-The-Opening auction
+    ATC       = 3   # At-The-Close auction
+```
+
+`BidAskFlag` is an `IntEnum`, so it is interchangeable with `int`:
+
+```python
+BidAskFlag.NORMAL == 1       # True
+int(BidAskFlag.ATO)          # 2
+BidAskFlag(3)                # BidAskFlag.ATC
+BidAskFlag(99)               # raises ValueError
+```
+
+This interchangeability matters for the hot path -- see the
+`model_construct()` section below.
+
+---
+
+## is_auction() Method
+
+Both `BestBidAsk` and `FullBidOffer` expose an `is_auction()` method that
+returns `True` when either the bid or ask flag is `ATO` or `ATC`:
+
+```python
+event = BestBidAsk(..., bid_flag=BidAskFlag.ATO, ask_flag=BidAskFlag.ATO, ...)
+assert event.is_auction() is True
+
+event = BestBidAsk(..., bid_flag=BidAskFlag.NORMAL, ask_flag=BidAskFlag.NORMAL, ...)
+assert event.is_auction() is False
+```
+
+Internally both models delegate to a shared `_is_auction(bid_flag, ask_flag)`
+helper that compares against a constant `_AUCTION_FLAGS` tuple. Because
+`BidAskFlag` is an `IntEnum`, the comparison works with both enum members
+and plain `int` values.
+
+---
+
+## Construction: Validated vs. Hot Path
+
+### Regular Construction (with validation)
+
+```python
 event = BestBidAsk(
     symbol="AOT",
     bid=25.5,
-    extra_field="invalid",  # Not allowed
+    ask=26.0,
+    bid_vol=1000,
+    ask_vol=500,
+    bid_flag=BidAskFlag.NORMAL,
+    ask_flag=BidAskFlag.NORMAL,
+    recv_ts=1739500000000000000,
+    recv_mono_ns=123456789,
 )
 ```
 
-**Test**: `test_events.py::TestBestBidAsk::test_extra_fields_rejected`
+Pydantic runs all validators: type coercion, range checks (`ge=0`),
+length constraints, and `int` to `BidAskFlag` conversion. Use this path
+for tests and any data from untrusted sources.
 
----
-
-### Field Validation
-
-**Contract**: Field values must pass Pydantic validation.
+### model_construct() -- Hot Path (no validation)
 
 ```python
-# ❌ recv_mono_ns must be >= 0
-event = BestBidAsk(..., recv_mono_ns=-1)  # Raises ValidationError
+event = BestBidAsk.model_construct(
+    symbol="AOT",
+    bid=25.5,
+    ask=26.0,
+    bid_vol=1000,
+    ask_vol=500,
+    bid_flag=1,             # stored as int, NOT BidAskFlag
+    ask_flag=1,
+    recv_ts=1739500000000000000,
+    recv_mono_ns=123456789,
+    connection_epoch=0,
+)
 ```
 
-**Test**: `test_events.py::TestBestBidAsk::test_recv_mono_ns_negative_rejected`
+`model_construct()` bypasses ALL Pydantic validation. This is used in the
+MQTT adapter hot path to avoid allocation and CPU overhead.
+
+**Dangers of model_construct():**
+
+| Concern | What happens |
+| --- | --- |
+| No type coercion | `bid_flag` stays as `int`, not `BidAskFlag` |
+| No range checks | Negative timestamps pass silently |
+| No length checks | Tuples with != 10 elements pass silently |
+| No extra-field rejection | Typos in field names are silently ignored |
+| No default filling | `connection_epoch` must be passed explicitly |
+
+The `is_auction()` method still works correctly with plain `int` flags
+because the underlying `_is_auction()` function uses `in` membership
+testing against `IntEnum` values, and `2 in (BidAskFlag.ATO, BidAskFlag.ATC)`
+evaluates to `True`.
 
 ---
 
-## Hot Path Construction
+## String-to-Int Coercion
 
-**Normal** (with validation):
+During validated construction, Pydantic coerces compatible types
+automatically. For example, string values that represent integers are
+accepted for `int` fields:
+
 ```python
-event = BestBidAsk(symbol="AOT", bid=25.5, ...)
-# Pydantic validation runs
+event = BestBidAsk(
+    ...,
+    recv_ts="1739500000000000000",   # string coerced to int
+    recv_mono_ns="123456789",        # string coerced to int
+)
 ```
 
-**Hot path** (skip validation):
-```python
-event = BestBidAsk.model_construct(symbol="AOT", bid=25.5, ...)
-# Pydantic validation skipped
-```
-
-⚠️ **Warning**: Only use `model_construct()` when data is pre-validated (trusted source).
+This coercion does NOT happen with `model_construct()`.
 
 ---
 
-## Helper Methods
+## Summary Table
 
-### is_auction()
-
-**Contract**: Returns `True` if bid or ask is in auction (ATO/ATC).
-
-```python
-event = BestBidAsk(..., bid_flag=BidAskFlag.ATO, ...)
-assert event.is_auction()  # True
-```
-
-**Test**: `test_events.py::TestBestBidAsk::test_is_auction`
+| Property | Guarantee |
+| --- | --- |
+| Immutable | `frozen=True` -- assignment raises `ValidationError` |
+| Hashable | Can be used in `set` and as `dict` key |
+| Equality | Value-based -- same fields means `==` is `True` |
+| Strict schema | `extra="forbid"` -- unknown fields rejected |
+| Auction detection | `is_auction()` on both models |
+| Hot-path safe | `model_construct()` skips validation for performance |
 
 ---
 
-## Implementation Reference
+## Related Pages
 
-See [core/events.py](../../core/events.py):
-- `BestBidAsk` model (lines ~100-150)
-- `FullBidOffer` model (lines ~180-230)
-- `BidAskFlag` enum (lines ~70-90)
-
----
-
-## Test Coverage
-
-**BestBidAsk** (24 tests):
-- Creation, validation, immutability
-- Hashability, equality
-- Field constraints
-- Helper methods
-
-**FullBidOffer** (24 tests):
-- Same coverage as BestBidAsk
-- Tuple field validation
-
----
-
-## Next Steps
-
-- **[BestBidAsk](./best_bid_ask.md)** — Detailed field reference
-- **[FullBidOffer](./full_bid_offer.md)** — Full depth reference
-- **[Timestamp and Epoch](./timestamp_and_epoch.md)** — Timestamp semantics
+- [BestBidAsk](./best_bid_ask.md) -- field reference for top-of-book events
+- [FullBidOffer](./full_bid_offer.md) -- field reference for 10-level depth
+- [Timestamp and Epoch](./timestamp_and_epoch.md) -- dual timestamp and reconnect semantics

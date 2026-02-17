@@ -1,150 +1,28 @@
 # BestBidAsk
 
-Top-of-book market data event model.
+Top-of-book (Level 1) market data event. This is the default event type
+produced by `BidOfferAdapter`.
 
 ---
 
 ## Field Reference
 
-### symbol: str
-Stock ticker symbol (uppercase normalized).
-
-**Example**: `"AOT"`, `"PTT"`
-
-**Validation**: None (string accepted)
-
-**Normalization**: Converted to uppercase by adapter
-
----
-
-### bid: float
-Best bid price (highest buyer price).
-
-**Example**: `25.50`, `100.25`
-
-**Validation**: Must be finite (`not inf`, `not nan`)
-
-**Allow negative**: Yes (edge cases, derivatives)
-
-**Allow zero**: Yes (auction periods)
+| Field | Type | Constraint | Description |
+| --- | --- | --- | --- |
+| `symbol` | `str` | `min_length=1` | Stock symbol, e.g. `"AOT"` |
+| `bid` | `float` | none | Best bid price |
+| `ask` | `float` | none | Best ask price |
+| `bid_vol` | `int` | `ge=0` | Volume at best bid |
+| `ask_vol` | `int` | `ge=0` | Volume at best ask |
+| `bid_flag` | `BidAskFlag` | enum | Bid session flag (UNDEFINED/NORMAL/ATO/ATC) |
+| `ask_flag` | `BidAskFlag` | enum | Ask session flag |
+| `recv_ts` | `int` | `ge=0` | Wall-clock nanosecond timestamp (`time.time_ns()`) |
+| `recv_mono_ns` | `int` | `ge=0` | Monotonic nanosecond timestamp (`time.perf_counter_ns()`) |
+| `connection_epoch` | `int` | `default=0, ge=0` | Reconnect version counter |
 
 ---
 
-### ask: float
-Best ask price (lowest seller price).
-
-**Example**: `25.75`, `100.50`
-
-**Validation**: Must be finite  
-
-**Allow negative**: Yes
-
-**Allow zero**: Yes (auction periods)
-
----
-
-### bid_vol: int
-Best bid volume (shares at bid price).
-
-**Example**: `1000`, `50000`
-
-**Validation**: Non-negative integer (protobuf guarantees)
-
----
-
-### ask_vol: int
-Best ask volume (shares at ask price).
-
-**Example**: `500`, `25000`
-
-**Validation**: Non-negative integer
-
----
-
-### bid_flag: int
-Market session flag for bid side.
-
-**Values**:
-- `0` = UNDEFINED
-- `1` = NORMAL (continuous trading)
-- `2` = ATO (At-The-Opening auction)
-- `3` = ATC (At-The-Close auction)
-
-**Note**: During ATO/ATC, prices are typically zero.
-
----
-
-### ask_flag: int
-Market session flag for ask side.
-
-**Values**: Same as `bid_flag`
-
----
-
-### recv_ts: int
-Wall clock timestamp (nanoseconds since Unix epoch).
-
-**Source**: `time.time_ns()` at message receipt
-
-**Use**: Correlation with external logs, exchange timestamps
-
-**Subject to**: NTP adjustment (may jump backwards)
-
----
-
-### recv_mono_ns: int
-Monotonic timestamp (nanoseconds).
-
-**Source**: `time.perf_counter_ns()` at message receipt  
-
-**Use**: Latency measurement
-
-**Guarantee**: Never goes backwards
-
-**Validation**: Must be >= 0
-
----
-
-### connection_epoch: int
-Reconnect counter (increments on each reconnect).
-
-**Initial value**: 0
-
-**Use**: Detect reconnects in strategy code
-
-**Example**:
-```python
-last_epoch = 0
-for event in dispatcher.poll():
-    if event.connection_epoch != last_epoch:
-        print(f"Reconnect detected! Epoch: {event.connection_epoch}")
-        clear_state()
-        last_epoch = event.connection_epoch
-```
-
----
-
-## Helper Methods
-
-### is_auction() -> bool
-
-Returns `True` if bid or ask is in auction period (ATO or ATC).
-
-```python
-event = BestBidAsk(..., bid_flag=BidAskFlag.ATO, ...)
-assert event.is_auction()  # True
-```
-
-**Implementation**:
-```python
-def is_auction(self) -> bool:
-    return self.bid_flag in (BidAskFlag.ATO, BidAskFlag.ATC) or \
-           self.ask_flag in (BidAskFlag.ATO, BidAskFlag.ATC)
-```
-
----
-
-## Example Usage
+## Usage Example
 
 ```python
 from core.events import BestBidAsk, BidAskFlag
@@ -159,47 +37,143 @@ event = BestBidAsk(
     ask_flag=BidAskFlag.NORMAL,
     recv_ts=1739500000000000000,
     recv_mono_ns=123456789,
-    connection_epoch=0,
 )
 
-# Access fields
-print(f"{event.symbol}: bid={event.bid}, ask={event.ask}")
+print(f"{event.symbol}: {event.bid} x {event.bid_vol} / "
+      f"{event.ask} x {event.ask_vol}")
 
-# Check auction
 if event.is_auction():
-    print("In auction period")
-
-# Compare prices (use tolerance!)
-if abs(event.ask - event.bid) < 0.01:
-    print("Tight spread")
+    print("Auction period -- prices may be zero")
 ```
 
 ---
 
-## Implementation Reference
+## Price Semantics
 
-See [core/events.py](../../core/events.py):
-- `BestBidAsk` class definition
-- `is_auction()` method
-- Field validators
+### Negative prices are allowed
+
+The `bid` and `ask` fields have no lower bound. Negative prices can
+occur in derivatives or other edge cases. Pydantic does not reject them:
+
+```python
+event = BestBidAsk(symbol="FUT", bid=-1.5, ask=-1.0, ...)
+# valid -- no ValidationError
+```
+
+### Zero prices during ATO/ATC
+
+During auction periods (At-The-Opening, At-The-Close), the exchange
+typically sends zero prices. Strategy code should check `is_auction()`
+before interpreting price data:
+
+```python
+event = BestBidAsk(
+    symbol="AOT",
+    bid=0.0,
+    ask=0.0,
+    bid_vol=0,
+    ask_vol=0,
+    bid_flag=BidAskFlag.ATO,
+    ask_flag=BidAskFlag.ATO,
+    recv_ts=1739500000000000000,
+    recv_mono_ns=100000000,
+)
+
+assert event.is_auction() is True
+# Do not use bid/ask for spread calculation here
+```
+
+### bid > ask is allowed
+
+There is no cross-validation between `bid` and `ask`. The model does not
+reject a bid price that exceeds the ask price. This can happen during
+auction periods or due to exchange-specific behavior:
+
+```python
+event = BestBidAsk(symbol="AOT", bid=26.0, ask=25.5, ...)
+# valid -- no ValidationError
+```
 
 ---
 
-## Test Coverage
+## Volume Constraints
 
-24 tests in `test_events.py::TestBestBidAsk`
+`bid_vol` and `ask_vol` must be non-negative integers (`ge=0`). Negative
+volumes raise a `ValidationError` during regular construction:
 
-Key tests:
-- Field validation
-- Immutability (frozen)
-- Hashability
-- Equality
-- `is_auction()` correctness
+```python
+BestBidAsk(symbol="AOT", bid=25.5, ask=26.0,
+           bid_vol=-100, ask_vol=500, ...)
+# raises ValidationError
+```
 
 ---
 
-## Next Steps
+## is_auction() Method
 
-- **[Event Contract](./event_contract.md)** — Model specifications
-- **[FullBidOffer](./full_bid_offer.md)** — Full 10-level book
-- **[Timestamp and Epoch](./timestamp_and_epoch.md)** — Timestamp semantics
+Returns `True` if either `bid_flag` or `ask_flag` is `ATO` (2) or
+`ATC` (3):
+
+```python
+event = BestBidAsk(..., bid_flag=BidAskFlag.ATC, ask_flag=BidAskFlag.NORMAL, ...)
+assert event.is_auction() is True   # one side is enough
+```
+
+---
+
+## Hot-Path Construction with model_construct()
+
+In the MQTT adapter, events are built with `model_construct()` to skip
+Pydantic validation and reduce latency:
+
+```python
+event = BestBidAsk.model_construct(
+    symbol=symbol,
+    bid=bid_price,
+    ask=ask_price,
+    bid_vol=bid_volume,
+    ask_vol=ask_volume,
+    bid_flag=raw_bid_flag,       # int, not BidAskFlag
+    ask_flag=raw_ask_flag,       # int, not BidAskFlag
+    recv_ts=ts,
+    recv_mono_ns=mono,
+    connection_epoch=epoch,
+)
+```
+
+When constructed this way:
+
+- No type coercion runs -- `bid_flag` is stored as a plain `int`, not a
+  `BidAskFlag` member.
+- No constraint checks run -- negative timestamps or volumes would not
+  be caught.
+- `connection_epoch` has no default -- it must be passed explicitly.
+- `is_auction()` still works correctly because `IntEnum` comparison
+  accepts plain `int` values.
+
+Use `model_construct()` only when the data source is trusted (i.e., the
+protobuf adapter layer). Use regular construction for tests and any
+external or untrusted data.
+
+---
+
+## Immutability
+
+The model is frozen. Any field assignment after construction raises a
+`ValidationError`:
+
+```python
+event = BestBidAsk(symbol="AOT", bid=25.5, ...)
+event.bid = 30.0   # raises ValidationError
+```
+
+See [Event Contract](./event_contract.md) for additional model guarantees
+(hashability, equality by value, extra field rejection).
+
+---
+
+## Related Pages
+
+- [Event Contract](./event_contract.md) -- shared model guarantees
+- [FullBidOffer](./full_bid_offer.md) -- full 10-level depth book
+- [Timestamp and Epoch](./timestamp_and_epoch.md) -- dual timestamp and reconnect semantics

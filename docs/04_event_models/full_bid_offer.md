@@ -1,168 +1,162 @@
 # FullBidOffer
 
-Full 10-level order book (Level 2) market data event model.
+Full 10-level order book (Level 2) market data event. Produced by
+`BidOfferAdapter` when `full_depth=True` is set in `BidOfferAdapterConfig`.
 
 ---
 
-## Overview
+## Enabling Full Depth
 
-`FullBidOffer` provides **complete depth-of-market** data:
-- 10 price levels on bid side (buy orders)
-- 10 price levels on ask side (sell orders)
-- Volumes at each price level
-- Session flags (NORMAL/ATO/ATC)
+By default the adapter emits `BestBidAsk` events (Level 1 only). To
+receive `FullBidOffer` events, set `full_depth=True` in the adapter
+configuration:
 
-**Note**: Not all symbols provide 10 levels. Some may only have 5 or fewer levels with remaining slots filled with zeros.
+```python
+config = BidOfferAdapterConfig(
+    full_depth=True,
+    # ... other settings
+)
+```
 
 ---
 
 ## Field Reference
 
-### symbol: str
-Stock ticker symbol (uppercase normalized).
+| Field | Type | Constraint | Description |
+| --- | --- | --- | --- |
+| `symbol` | `str` | `min_length=1` | Stock symbol, e.g. `"AOT"` |
+| `bid_prices` | `tuple[float, ...]` | exactly 10 elements | 10 bid prices, index 0 = best bid |
+| `ask_prices` | `tuple[float, ...]` | exactly 10 elements | 10 ask prices, index 0 = best ask |
+| `bid_volumes` | `tuple[int, ...]` | exactly 10 elements | 10 bid volumes |
+| `ask_volumes` | `tuple[int, ...]` | exactly 10 elements | 10 ask volumes |
+| `bid_flag` | `BidAskFlag` | enum | Bid session flag (UNDEFINED/NORMAL/ATO/ATC) |
+| `ask_flag` | `BidAskFlag` | enum | Ask session flag |
+| `recv_ts` | `int` | `ge=0` | Wall-clock nanosecond timestamp (`time.time_ns()`) |
+| `recv_mono_ns` | `int` | `ge=0` | Monotonic nanosecond timestamp (`time.perf_counter_ns()`) |
+| `connection_epoch` | `int` | `default=0, ge=0` | Reconnect version counter |
 
 ---
 
-### bid_prices: tuple[float, ...]
-10 bid prices (best to worst).
+## Tuple Length: Exactly 10
 
-**Example**: `(25.50, 25.25, 25.00, 24.75, ..., 0.0)`
-
-**Length**: Exactly 10 elements
-
-**Order**: Descending (highest first)
-
-**Validation**: Must be tuple (immutable)
-
-**Empty levels**: Represented as `0.0`
-
----
-
-### ask_prices: tuple[float, ...]
-10 ask prices (best to worst).
-
-**Example**: `(25.75, 26.00, 26.25, 26.50, ..., 0.0)`
-
-**Length**: Exactly 10 elements
-
-**Order**: Ascending (lowest first)
-
-**Validation**: Must be tuple (immutable)
-
-**Empty levels**: Represented as `0.0`
-
----
-
-### bid_volumes: tuple[int, ...]
-10 bid volumes (shares at each price level).
-
-**Example**: `(1000, 500, 300, ..., 0)`
-
-**Length**: Exactly 10 elements
-
-**Validation**: Must be tuple of integers
-
-**Empty levels**: Represented as `0`
-
----
-
-### ask_volumes: tuple[int, ...]
-10 ask volumes (shares at each price level).
-
-**Example**: `(500, 800, 1200, ..., 0)`
-
-**Length**: Exactly 10 elements
-
-**Validation**: Must be tuple of integers
-
-**Empty levels**: Represented as `0`
-
----
-
-### bid_flag: int
-Market session flag for bid side.
-
-**Values**:
-- `0` = UNDEFINED
-- `1` = NORMAL (continuous trading)
-- `2` = ATO (At-The-Opening auction)
-- `3` = ATC (At-The-Close auction)
-
----
-
-### ask_flag: int
-Market session flag for ask side.
-
-**Values**: Same as `bid_flag`
-
----
-
-### recv_ts: int
-Wall clock timestamp (nanoseconds since Unix epoch).
-
-See [BestBidAsk](./best_bid_ask.md#recv_ts-int) for details.
-
----
-
-### recv_mono_ns: int
-Monotonic timestamp (nanoseconds).
-
-See [BestBidAsk](./best_bid_ask.md#recv_mono_ns-int) for details.
-
----
-
-### connection_epoch: int
-Reconnect counter (increments on each reconnect).
-
-See [BestBidAsk](./best_bid_ask.md#connection_epoch-int) for details.
-
----
-
-## Data Characteristics
-
-### Tuple Immutability
-
-All price/volume sequences are **Python tuples** (not lists).
-
-**Why tuples?**
-- ✅ Immutable (consistent with `frozen=True` Pydantic model)
-- ✅ Hashable (enables caching and deduplication)
-- ✅ Slightly faster than lists for fixed-size data
+Every price and volume tuple must contain exactly 10 elements. Pydantic
+enforces this with `min_length=10, max_length=10`:
 
 ```python
-event = FullBidOffer(
-    bid_prices=(25.50, 25.25, ...),  # ✅ Tuple
-    bid_volumes=(1000, 500, ...),    # ✅ Tuple
-)
+# Too few elements -- raises ValidationError
+FullBidOffer(symbol="AOT",
+             bid_prices=(25.5, 25.25, 25.0),   # only 3
+             ...)
 
-# ❌ Raises ValidationError
-event = FullBidOffer(
-    bid_prices=[25.50, 25.25, ...],  # ❌ List not allowed
+# Too many elements -- raises ValidationError
+FullBidOffer(symbol="AOT",
+             bid_prices=(25.5,) * 11,           # 11 elements
+             ...)
+```
+
+Unused levels are filled with `0.0` (prices) or `0` (volumes):
+
+```python
+bid_prices=(25.50, 25.25, 25.00, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+bid_volumes=(1000, 500, 300, 0, 0, 0, 0, 0, 0, 0)
+```
+
+---
+
+## Level 1 Matches BestBidAsk
+
+The first element of each tuple corresponds to the top-of-book data in
+a `BestBidAsk` event for the same symbol and timestamp:
+
+```python
+full = FullBidOffer(symbol="AOT", bid_prices=(25.50, 25.25, ...), ...)
+
+# These match the equivalent BestBidAsk fields:
+best_bid   = full.bid_prices[0]     # == BestBidAsk.bid
+best_ask   = full.ask_prices[0]     # == BestBidAsk.ask
+best_bvol  = full.bid_volumes[0]    # == BestBidAsk.bid_vol
+best_avol  = full.ask_volumes[0]    # == BestBidAsk.ask_vol
+```
+
+To convert a `FullBidOffer` to a `BestBidAsk`:
+
+```python
+from core.events import BestBidAsk
+
+bba = BestBidAsk(
+    symbol=full.symbol,
+    bid=full.bid_prices[0],
+    ask=full.ask_prices[0],
+    bid_vol=full.bid_volumes[0],
+    ask_vol=full.ask_volumes[0],
+    bid_flag=full.bid_flag,
+    ask_flag=full.ask_flag,
+    recv_ts=full.recv_ts,
+    recv_mono_ns=full.recv_mono_ns,
+    connection_epoch=full.connection_epoch,
 )
 ```
 
 ---
 
-### Level Semantics
+## Deep Immutability
 
-**Best prices** (Level 1):
+The model uses tuples (not lists) for all price and volume sequences.
+Combined with `frozen=True`, this provides deep immutability -- there is
+no way to mutate the event after construction:
+
 ```python
-best_bid = event.bid_prices[0]  # Highest bid
-best_ask = event.ask_prices[0]  # Lowest ask
+event = FullBidOffer(symbol="AOT", bid_prices=(25.5, ...), ...)
+
+event.bid_prices = (30.0, ...)       # raises ValidationError (frozen)
+event.bid_prices[0] = 30.0           # raises TypeError (tuple)
 ```
 
-**Empty levels**:
-```python
-# If only 3 bid levels active:
-bid_prices = (25.50, 25.25, 25.00, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-bid_volumes = (1000, 500, 300, 0, 0, 0, 0, 0, 0, 0)
-```
-
-**Contract**: If price is `0.0`, volume should also be `0`.
+This is important for thread safety: events can be shared between
+threads without synchronization.
 
 ---
 
-## Example Usage
+## Negative Volumes Are Allowed
+
+Unlike `BestBidAsk` where `bid_vol` and `ask_vol` have a `ge=0`
+constraint, the tuple elements inside `FullBidOffer` have no per-element
+validation. Negative volumes within the tuples will pass validation:
+
+```python
+event = FullBidOffer(
+    symbol="AOT",
+    bid_volumes=(1000, -500, 300, 0, 0, 0, 0, 0, 0, 0),
+    ...
+)
+# valid -- no ValidationError on individual tuple elements
+```
+
+This is a deliberate design choice: adding per-element validation to
+40 tuple elements would add significant overhead to the validated
+construction path. Strategy code should handle unexpected negative
+values defensively.
+
+---
+
+## Performance Caveat
+
+Each `FullBidOffer` message allocates approximately 46 Python objects:
+4 tuples plus 40 float/int element objects. At high message rates this
+creates measurable GC pressure.
+
+**Not intended for sub-100us strategies.** If your strategy requires
+ultra-low latency, use `BestBidAsk` (the default) which allocates far
+fewer objects.
+
+| Mode | Objects per message |
+| --- | --- |
+| `BestBidAsk` (default) | ~10 |
+| `FullBidOffer` (`full_depth=True`) | ~46 |
+
+---
+
+## Usage Example
 
 ```python
 from core.events import FullBidOffer, BidAskFlag
@@ -180,100 +174,28 @@ event = FullBidOffer(
     connection_epoch=0,
 )
 
-# Access best prices (Level 1)
-print(f"Best bid: {event.bid_prices[0]} x {event.bid_volumes[0]}")
-print(f"Best ask: {event.ask_prices[0]} x {event.ask_volumes[0]}")
-
-# Calculate total bid volume (all levels)
-total_bid_vol = sum(event.bid_volumes)
-print(f"Total bid volume: {total_bid_vol}")
-
-# Iterate active levels
-for i, (price, vol) in enumerate(zip(event.bid_prices, event.bid_volumes)):
+# Iterate active bid levels
+for i in range(10):
+    price = event.bid_prices[i]
+    vol = event.bid_volumes[i]
     if price == 0.0:
-        break  # No more active levels
-    print(f"Bid level {i+1}: {price} x {vol}")
+        break
+    print(f"  Level {i+1}: {price} x {vol}")
+
+# Total depth volume
+total_bid = sum(event.bid_volumes)
+total_ask = sum(event.ask_volumes)
+print(f"Total bid volume: {total_bid}, ask volume: {total_ask}")
+
+# Auction check
+if event.is_auction():
+    print("Auction period -- depth data may not reflect continuous trading")
 ```
 
 ---
 
-## Performance Notes
+## Related Pages
 
-### Tuple vs List
-
-**Tuple advantages**:
-- ~5-10% faster creation (C-level optimization)
-- Hashable (enables caching strategies)
-- Immutable (thread-safe reads)
-
-**Tuple disadvantages**:
-- Cannot modify in-place (must create new tuple)
-
-**Verdict**: Tuples are appropriate here since events are immutable.
-
----
-
-### Memory Layout
-
-Each `FullBidOffer` event:
-- 10 bid prices × 8 bytes = 80 bytes
-- 10 ask prices × 8 bytes = 80 bytes
-- 10 bid volumes × 8 bytes = 80 bytes
-- 10 ask volumes × 8 bytes = 80 bytes
-- String + metadata ≈ 120 bytes
-
-**Total**: ~440 bytes per event
-
-**Queue impact**: 10,000 events ≈ 4.4 MB
-
----
-
-## Conversion to BestBidAsk
-
-**Need top-of-book only?** Extract Level 1:
-
-```python
-def to_best_bid_ask(full: FullBidOffer) -> BestBidAsk:
-    return BestBidAsk(
-        symbol=full.symbol,
-        bid=full.bid_prices[0],
-        ask=full.ask_prices[0],
-        bid_vol=full.bid_volumes[0],
-        ask_vol=full.ask_volumes[0],
-        bid_flag=full.bid_flag,
-        ask_flag=full.ask_flag,
-        recv_ts=full.recv_ts,
-        recv_mono_ns=full.recv_mono_ns,
-        connection_epoch=full.connection_epoch,
-    )
-```
-
----
-
-## Implementation Reference
-
-See [core/events.py](../../core/events.py):
-- `FullBidOffer` class definition
-- Tuple field validators
-- Pydantic configuration
-
----
-
-## Test Coverage
-
-24 tests in `test_events.py::TestFullBidOffer`
-
-Key tests:
-- Tuple validation (reject lists)
-- Length validation (exactly 10 elements)
-- Immutability
-- Hashability
-- Equality
-
----
-
-## Next Steps
-
-- **[BestBidAsk](./best_bid_ask.md)** — Top-of-book reference
-- **[Event Contract](./event_contract.md)** — Model specifications
-- **[Timestamp and Epoch](./timestamp_and_epoch.md)** — Timestamp semantics
+- [BestBidAsk](./best_bid_ask.md) -- top-of-book event (lower latency)
+- [Event Contract](./event_contract.md) -- shared model guarantees
+- [Timestamp and Epoch](./timestamp_and_epoch.md) -- dual timestamp and reconnect semantics

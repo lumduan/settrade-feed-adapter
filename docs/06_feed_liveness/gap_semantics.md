@@ -1,407 +1,193 @@
 # Gap Semantics
 
-Understanding message delivery gaps and their implications.
+Time units, conversion, and gap measurement in the feed health monitor.
+
+Source: `core/feed_health.py` -- `FeedHealthMonitor`
 
 ---
 
 ## Overview
 
-A **gap** is a period where expected messages are not received.
-
-**Causes**:
-- Network instability (packet loss, reconnect)
-- Exchange outage (no data published)
-- Symbol illiquidity (no trades/quotes)
-- Subscription issues (not subscribed to symbol)
+The `FeedHealthMonitor` measures gaps between events using monotonic
+nanosecond timestamps. This page documents how time units are converted,
+how gaps are computed, and the design decisions behind the implementation.
 
 ---
 
-## Gap Types
+## Nanosecond Internal Representation
 
-### 1. Connection Gap
+Configuration uses seconds (human-friendly), but all internal state is stored
+in nanoseconds for integer arithmetic precision.
 
-**Definition**: No messages received from **any** symbol.
-
-**Detection**: Global liveness (`is_alive()` returns `False`)
-
-**Cause**: MQTT connection broken or stalled
-
-**Impact**: **Severe** — entire feed is down
-
-**Recovery**: Reconnect MQTT client
-
----
-
-### 2. Symbol Gap
-
-**Definition**: No messages received from **specific** symbol.
-
-**Detection**: Per-symbol liveness (`is_symbol_alive(symbol)` returns `False`)
-
-**Cause**: Symbol-specific issue (not subscribed, illiquid, exchange halt)
-
-**Impact**: **Moderate** — single symbol affected
-
-**Recovery**: Resubscribe, check exchange status
-
----
-
-### 3. Transient Gap
-
-**Definition**: Brief interruption (< timeout duration).
-
-**Detection**: None (within tolerance)
-
-**Cause**: Temporary network blip, burst of events elsewhere
-
-**Impact**: **Low** — no action needed
-
-**Recovery**: Self-recovers automatically
-
----
-
-## Gap Detection
-
-### Global Gap Detection
-
-**Method**: Monitor `is_alive()` status.
+At construction time, `FeedHealthMonitor` converts:
 
 ```python
-from core.feed_health import FeedHealth
-import time
-
-feed_health = FeedHealth(global_timeout_sec=5.0)
-
-last_alive = True
-
-while True:
-    is_alive = feed_health.is_alive()
-    
-    if last_alive and not is_alive:
-        print("🚨 CONNECTION GAP DETECTED")
-        # Alert, reconnect, etc.
-    
-    last_alive = is_alive
-    time.sleep(1.0)
+_max_gap_ns = int(max_gap_seconds * 1_000_000_000)
+_per_symbol_max_gap_ns = {
+    symbol: int(gap * 1_000_000_000)
+    for symbol, gap in config.per_symbol_max_gap.items()
+}
 ```
 
-**Test**: `test_feed_health.py::test_is_alive_returns_false_when_stale`
+This conversion happens once at init and is cached. The frozen config ensures
+the cached values cannot desync from the config.
 
 ---
 
-### Symbol Gap Detection
+## Monotonic Timestamps
 
-**Method**: Monitor `is_symbol_alive(symbol)` for each tracked symbol.
+All timestamps use `time.perf_counter_ns()` exclusively. This is a monotonic
+clock that:
+
+- Never goes backwards (immune to NTP adjustments)
+- Has nanosecond resolution
+- Is not affected by system clock changes, leap seconds, or daylight savings
+- Is suitable for measuring elapsed time, not wall-clock time
+
+The `now_ns` parameter on all query methods (`is_feed_dead()`, `is_stale()`,
+`stale_symbols()`, `last_seen_gap_ms()`) allows injecting a pre-captured
+timestamp. This avoids redundant `perf_counter_ns()` calls when checking
+multiple symbols in a single poll loop:
 
 ```python
-from core.feed_health import FeedHealth
-import time
-
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-TRACKED_SYMBOLS = ["AOT", "PTT", "CPALL"]
-last_status = {s: True for s in TRACKED_SYMBOLS}
-
-while True:
-    for symbol in TRACKED_SYMBOLS:
-        is_alive = feed_health.is_symbol_alive(symbol)
-        
-        if last_status[symbol] and not is_alive:
-            print(f"⚠️ SYMBOL GAP: {symbol}")
-            # Alert, resubscribe, etc.
-        
-        last_status[symbol] = is_alive
-    
-    time.sleep(1.0)
+now = time.perf_counter_ns()
+is_dead = monitor.is_feed_dead(now_ns=now)
+stale = monitor.stale_symbols(now_ns=now)
+gap_ptt = monitor.last_seen_gap_ms("PTT", now_ns=now)
 ```
 
-**Test**: `test_feed_health.py::test_is_symbol_alive_returns_false_when_stale`
+If `now_ns` is not provided, each method captures its own timestamp internally.
 
 ---
 
-## Gap Semantics
+## Gap Computation
 
-### Gap vs Stale
+All gap computations follow the same pattern:
 
-**Stale**: Current status (snapshot)
-- Symbol has not received events for > timeout
+```text
+gap = max(0, now - last_event_ns)
+```
 
-**Gap**: Event detection (edge trigger)
-- Transition from alive → stale
+The `max(0, ...)` clamp prevents negative deltas from producing incorrect
+results. A negative delta can occur when `now_ns` is injected with a value
+earlier than the last recorded timestamp (e.g., in tests or if timestamps
+are captured in an unexpected order).
+
+The comparison is strictly greater than:
+
+```text
+return gap > threshold_ns
+```
+
+This means a gap exactly equal to the threshold is **not** considered
+stale/dead. The feed must exceed the threshold to trigger detection.
+
+---
+
+## Negative Delta Clamping
+
+When `now_ns` is less than the last recorded timestamp, the gap is clamped
+to zero rather than producing a negative value. This ensures:
+
+- `is_feed_dead()` returns `False` (gap 0 is not > threshold)
+- `is_stale()` returns `False` (gap 0 is not > threshold)
+- `last_seen_gap_ms()` returns `0.0` (not a negative millisecond value)
 
 ```python
-# Symbol is alive
-assert feed_health.is_symbol_alive("AOT")  # True
+monitor = FeedHealthMonitor()
+monitor.on_event("PTT", now_ns=1_000_000_000)
 
-# ... time passes > timeout ...
-
-# Symbol is now stale (GAP OCCURRED)
-assert not feed_health.is_symbol_alive("AOT")  # False
+# now_ns < last event -- clamped to 0
+monitor.last_seen_gap_ms("PTT", now_ns=500_000_000)   # 0.0
+monitor.is_stale("PTT", now_ns=500_000_000)            # False
+monitor.is_feed_dead(now_ns=500_000_000)                # False
 ```
+
+Tests:
+
+- `test_feed_health.py::TestGlobalFeedLiveness::test_negative_delta_clamped`
+- `test_feed_health.py::TestPerSymbolLiveness::test_negative_delta_clamped_per_symbol`
+- `test_feed_health.py::TestLastSeenGapMs::test_negative_delta_clamped`
 
 ---
 
-### Gap Recovery
-
-**Contract**: Gap ends when next event is received.
+## last_seen_gap_ms()
 
 ```python
-feed_health = FeedHealth(symbol_timeout_sec=10.0)
-
-feed_health.record_event("AOT")  # t=0
-time.sleep(11)  # Gap! (> timeout)
-
-# Symbol is stale
-assert not feed_health.is_symbol_alive("AOT")
-
-# Receive new event
-feed_health.record_event("AOT")  # Gap ends
-
-# Symbol is alive again
-assert feed_health.is_symbol_alive("AOT")
+def last_seen_gap_ms(self, symbol: str, now_ns: int | None = None) -> float | None
 ```
 
-**Test**: `test_feed_health.py::test_gap_recovery`
+Returns the gap in **milliseconds** since the last event for a symbol, or
+`None` if the symbol has never been seen.
 
----
+The conversion from nanoseconds to milliseconds:
 
-### Gap Duration
-
-**Definition**: Time elapsed since last message.
-
-**Calculation**:
-```python
-import time
-
-def get_gap_duration(feed_health: FeedHealth, symbol: str) -> float:
-    """Get gap duration in seconds for symbol."""
-    last_ts = feed_health._symbol_timestamps.get(symbol)
-    
-    if last_ts is None:
-        return float('inf')  # Never seen
-    
-    now = time.time()
-    return now - last_ts
+```text
+gap_ms = max(0, now - last_ns) / 1_000_000
 ```
-
-**Example**:
-```python
-feed_health.record_event("AOT")  # t=0
-time.sleep(15)  # Wait 15 seconds
-
-gap_duration = get_gap_duration(feed_health, "AOT")
-print(f"Gap duration: {gap_duration:.2f} sec")  # ~15.00
-```
-
----
-
-## Gap Handling Strategies
-
-### 1. Ignore (for transient gaps)
-
-**When**: Gap < symbol_timeout (self-recovers)
-
-**Action**: None
 
 ```python
-# Just continue processing
-for event in dispatcher.poll():
-    feed_health.record_event(event.symbol)
-    process_event(event)
+monitor = FeedHealthMonitor()
+base_ns = 1_000_000_000_000
+monitor.on_event("PTT", now_ns=base_ns)
+
+gap = monitor.last_seen_gap_ms("PTT", now_ns=base_ns + 500_000_000)
+# gap == 500.0 (milliseconds)
+
+gap = monitor.last_seen_gap_ms("UNKNOWN")
+# gap is None (never seen)
 ```
+
+Tests:
+
+- `test_feed_health.py::TestLastSeenGapMs::test_returns_none_for_unknown_symbol`
+- `test_feed_health.py::TestLastSeenGapMs::test_returns_correct_gap`
+- `test_feed_health.py::TestLastSeenGapMs::test_negative_delta_clamped`
 
 ---
 
-### 2. Alert (for monitoring)
+## Per-Symbol Override Dictionary
 
-**When**: Gap > symbol_timeout (symbol stale)
-
-**Action**: Log, send alert
+The `per_symbol_max_gap` field in `FeedHealthConfig` maps symbol names to
+custom gap thresholds in seconds:
 
 ```python
-import logging
-
-logger = logging.getLogger(__name__)
-
-for symbol in TRACKED_SYMBOLS:
-    if not feed_health.is_symbol_alive(symbol):
-        logger.warning(f"Symbol gap detected: {symbol}")
-        send_alert(f"Symbol {symbol} is stale")
+config = FeedHealthConfig(
+    max_gap_seconds=5.0,
+    per_symbol_max_gap={"RARE": 60.0, "ILLIQUID": 30.0},
+)
 ```
 
----
-
-### 3. Resubscribe (for symbol gaps)
-
-**When**: Symbol stale but connection alive
-
-**Action**: Resubscribe to symbol
+At init, each override is converted to nanoseconds and stored in
+`_per_symbol_max_gap_ns`. When checking staleness, the monitor looks up the
+symbol in the override dictionary first. If not found, it falls back to the
+global `_max_gap_ns`.
 
 ```python
-from infra.settrade_mqtt import SettradeMQTTClient
-
-client = SettradeMQTTClient(...)
-
-for symbol in TRACKED_SYMBOLS:
-    if not feed_health.is_symbol_alive(symbol) and feed_health.is_alive():
-        logger.info(f"Resubscribing to {symbol}")
-        client.subscribe_to_symbol(symbol)
+# In is_stale() and stale_symbols():
+max_gap = self._per_symbol_max_gap_ns.get(symbol, self._max_gap_ns)
+gap = max(0, now - last_ns)
+return gap > max_gap
 ```
 
----
-
-### 4. Reconnect (for connection gaps)
-
-**When**: Global feed stale (no recent events from any symbol)
-
-**Action**: Reconnect MQTT client
-
-```python
-if not feed_health.is_alive():
-    logger.error("Connection gap detected, reconnecting...")
-    client.reconnect()
-```
+The `per_symbol_max_gap` dictionary uses `default_factory=dict`, so each
+config instance gets its own dictionary (no shared mutable default).
 
 ---
 
-### 5. Reset State (for strategy safety)
+## Configuration Constraints
 
-**When**: Gap detected in critical symbol
+| Field | Type | Default | Constraint |
+| --- | --- | --- | --- |
+| `max_gap_seconds` | `float` | `5.0` | `gt=0` (must be positive) |
+| `per_symbol_max_gap` | `dict[str, float]` | `{}` | No constraints on values |
 
-**Action**: Reset strategy state to avoid stale data
-
-```python
-CRITICAL_SYMBOLS = ["AOT", "PTT"]
-
-for symbol in CRITICAL_SYMBOLS:
-    if not feed_health.is_symbol_alive(symbol):
-        logger.warning(f"Critical symbol gap: {symbol}, resetting state")
-        reset_positions()
-        reset_cached_data()
-        break
-```
+`FeedHealthConfig` is a frozen Pydantic model (`frozen=True`, `extra="forbid"`).
+Mutating fields or passing extra fields raises `ValidationError`.
 
 ---
 
-## Gap Metrics
+## Related Pages
 
-### Connection Gap Count
-
-**Definition**: Number of times global feed became stale.
-
-```python
-connection_gap_count = 0
-
-last_alive = True
-
-while True:
-    is_alive = feed_health.is_alive()
-    
-    if last_alive and not is_alive:
-        connection_gap_count += 1
-    
-    last_alive = is_alive
-```
-
----
-
-### Symbol Gap Count (per symbol)
-
-**Definition**: Number of times each symbol became stale.
-
-```python
-symbol_gap_count = {s: 0 for s in TRACKED_SYMBOLS}
-last_status = {s: True for s in TRACKED_SYMBOLS}
-
-while True:
-    for symbol in TRACKED_SYMBOLS:
-        is_alive = feed_health.is_symbol_alive(symbol)
-        
-        if last_status[symbol] and not is_alive:
-            symbol_gap_count[symbol] += 1
-        
-        last_status[symbol] = is_alive
-```
-
----
-
-### Gap Duration Distribution
-
-**Definition**: Histogram of gap durations.
-
-```python
-from collections import defaultdict
-
-gap_durations = defaultdict(list)
-
-def record_gap_ended(symbol: str, start_time: float, end_time: float):
-    duration = end_time - start_time
-    gap_durations[symbol].append(duration)
-
-# Analyze
-for symbol, durations in gap_durations.items():
-    avg = sum(durations) / len(durations)
-    max_dur = max(durations)
-    print(f"{symbol}: avg={avg:.2f}s, max={max_dur:.2f}s")
-```
-
----
-
-## Gap Testing
-
-### Simulating Connection Gap
-
-```python
-# Stop recording events (simulate stalled feed)
-feed_health.record_event("AOT")  # Last event
-time.sleep(global_timeout + 1)
-
-# Connection gap detected
-assert not feed_health.is_alive()
-```
-
-**Test**: `test_feed_health.py::test_is_alive_returns_false_when_stale`
-
----
-
-### Simulating Symbol Gap
-
-```python
-# Stop recording specific symbol
-feed_health.record_event("AOT")  # Last AOT event
-feed_health.record_event("PTT")  # PTT still alive
-
-time.sleep(symbol_timeout + 1)
-
-# AOT gap detected, PTT still alive
-assert not feed_health.is_symbol_alive("AOT")
-assert feed_health.is_symbol_alive("PTT")
-```
-
-**Test**: `test_feed_health.py::test_is_symbol_alive_independent`
-
----
-
-## Implementation Reference
-
-See:
-- [core/feed_health.py](../../core/feed_health.py) — Gap detection logic
-- [examples/example_feed_health.py](../../examples/example_feed_health.py) — Gap handling examples
-
----
-
-## Test Coverage
-
-Key tests in `test_feed_health.py`:
-- `test_is_alive_returns_false_when_stale` — Connection gap
-- `test_is_symbol_alive_returns_false_when_stale` — Symbol gap
-- `test_is_symbol_alive_independent` — Independent symbol gaps
-- `test_gap_recovery` — Gap recovery semantics
-
----
-
-## Next Steps
-
-- **[Global Liveness](./global_liveness.md)** — System-wide tracking
-- **[Per-Symbol Liveness](./per_symbol_liveness.md)** — Symbol-level tracking
-- **[Failure Scenarios](../08_testing_and_guarantees/failure_scenarios.md)** — Gap failure cases
+- [Global Liveness](./global_liveness.md) -- `is_feed_dead()` semantics
+- [Per-Symbol Liveness](./per_symbol_liveness.md) -- `is_stale()` and `stale_symbols()`

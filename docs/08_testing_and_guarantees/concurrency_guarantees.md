@@ -1,251 +1,191 @@
 # Concurrency Guarantees
 
-Thread safety contracts and concurrency model.
+Thread safety contracts and the concurrency model.
 
 ---
 
 ## Overview
 
-This document specifies all concurrency guarantees backed by test coverage. The system uses a **Single Producer, Single Consumer (SPSC)** model with specific thread safety contracts.
+The feed adapter uses a strictly partitioned concurrency model with two
+threads and one synchronization point. All safety guarantees depend on the
+CPython GIL and the single-producer, single-consumer (SPSC) contract.
 
 ---
 
-## Thread Model
+## Threading Model
 
-```
-┌──────────────────────────────┐
-│  Producer (MQTT IO Thread)   │
-│  • dispatcher.push(event)    │
-│  • Writes: _total_pushed     │
-│  • Writes: _total_dropped    │
-└──────────────────────────────┘
-           ↓
-    [Bounded Deque]
-           ↓
-┌──────────────────────────────┐
-│  Consumer (Strategy Thread)  │
-│  • dispatcher.poll()         │
-│  • Writes: _total_polled     │
-└──────────────────────────────┘
-```
+| Thread | Components | Operations |
+| --- | --- | --- |
+| MQTT IO thread | paho-mqtt loop, `_on_message`, `BidOfferAdapter._on_message`, `Dispatcher.push()` | Message receive, parse, normalize, push |
+| Strategy thread | `Dispatcher.poll()`, `FeedHealthMonitor`, strategy logic | Event consumption, liveness checks, trading logic |
+| Main thread | `connect()`, `subscribe()`, `unsubscribe()`, `shutdown()`, `clear()` | Lifecycle management |
+| Background daemon | `_reconnect_loop`, `_token_refresh_check` | Reconnection, token refresh |
 
 ---
 
-## Guarantees
+## SPSC Contract
 
-### 1. Concurrent Push/Poll is Safe
+The `Dispatcher` is **strictly single-producer, single-consumer (SPSC)**:
 
-**Contract**: Simultaneous `push()` and `poll()` operations do not corrupt data.
+- **Single producer:** Only the MQTT IO thread calls `push()`.
+- **Single consumer:** Only the strategy thread calls `poll()`.
+- **No concurrent clear:** `clear()` must not overlap with `push()` or `poll()`.
 
-**Test Coverage**: `test_dispatcher.py::TestConcurrency::test_concurrent_push_poll`
-
-**Mechanism**: CPython GIL makes `deque.append()` and `deque.popleft()` atomic.
-
-**Example**:
-```python
-# Thread 1 (MQTT IO)
-dispatcher.push(event)  # Atomic
-
-# Thread 2 (Strategy)
-events = dispatcher.poll(max_events=100)  # Atomic
-```
-
-**Note**: This guarantee is **CPython-specific**. PyPy, GraalPy, and nogil Python require explicit locking.
+Any change to this threading model (multi-producer, multi-consumer)
+invalidates all safety guarantees. If MPMC is needed, replace `deque` with
+`threading.Queue` or add explicit locking.
 
 ---
 
-### 2. Single-Writer Per Counter
+## CPython GIL Assumption
 
-**Contract**: No two threads write to the same counter.
+The dispatcher relies on CPython's GIL for atomic operations:
 
-**Counters**:
-- `_total_pushed`: Written by producer only
-- `_total_dropped`: Written by producer only
-- `_total_polled`: Written by consumer only
+- `deque.append()` -- atomic under CPython GIL (single bytecode instruction)
+- `deque.popleft()` -- atomic under CPython GIL
+- `int` reads -- atomic under CPython GIL (single `LOAD_FAST`)
 
-**Guarantee**: No data races on counters.
+This is **NOT guaranteed** on:
 
----
+- PyPy
+- GraalPy
+- nogil Python (PEP 703)
 
-### 3. Eventually Consistent Stats
-
-**Contract**: `dispatcher.stats()` can be called from any thread but returns eventually consistent values.
-
-**Test Coverage**: `test_dispatcher.py::TestStats::test_stats_returns_frozen_model`
-
-**Guarantee**: Under quiescent conditions, stats are exact. During concurrent operations, stats reflect different points in time.
+If migrating away from CPython, replace `deque` with `threading.Queue` or a
+lock-protected buffer.
 
 ---
 
-### 4. Generation Prevents Stale Dispatch
+## Counter Contract (Single-Writer, Multi-Reader)
 
-**Contract**: Messages from old connections are never dispatched after reconnect.
+The dispatcher uses three counters with strict ownership:
 
-**Test Coverage**: `test_settrade_mqtt.py::TestMessageDispatch::test_stale_generation_rejected`
+| Counter | Writer Thread | Reader Threads |
+| --- | --- | --- |
+| `_total_pushed` | Push thread (MQTT IO) | Any (via `stats()`) |
+| `_total_dropped` | Push thread (MQTT IO) | Any (via `stats()`) |
+| `_total_polled` | Poll thread (strategy) | Any (via `stats()`) |
 
-**Mechanism**:
-1. On disconnect: `generation++`
-2. On message: `if self._generation != current_generation: reject`
-
-**Guarantee**: Reconnect safety.
-
----
-
-### 5. No Duplicate Reconnect Loops
-
-**Contract**: Only one reconnect thread runs at a time.
-
-**Test Coverage**: `test_settrade_mqtt.py::TestReconnect::test_schedule_reconnect_prevents_duplicates`
-
-**Mechanism**:
-```python
-if self._state != ClientState.RECONNECTING:
-    self._state = ClientState.RECONNECTING
-    spawn_reconnect_thread()
-```
-
-**Guarantee**: State check before thread spawn.
+No two threads ever write to the same counter. Reads from other threads see
+eventually-consistent values. CPython `int` reads are atomic (single bytecode
+instruction).
 
 ---
 
-### 6. Callback Isolation
+## Lock Usage
 
-**Contract**: Exception in one callback does not affect other callbacks or MQTT client.
+### Transport (`SettradeMQTTClient`)
 
-**Test Coverage**: `test_settrade_mqtt.py::TestMessageDispatch::test_callback_isolation`
+| Lock | Protects | Used By |
+| --- | --- | --- |
+| `_state_lock` | `_state` (ClientState) | All threads |
+| `_sub_lock` | `_subscriptions` dict | Main thread (write), IO thread (read) |
+| `_counter_lock` | `_messages_received`, `_callback_errors`, `_reconnect_count` | IO thread (write), any thread (read via `stats()`) |
+| `_reconnect_lock` | `_reconnecting` flag | Reconnect scheduling |
 
-**Mechanism**: Try-except around each callback invocation.
+### Adapter (`BidOfferAdapter`)
 
----
+| Lock | Protects | Used By |
+| --- | --- | --- |
+| `_sub_lock` | `_subscribed_symbols` set | Main thread (write), any thread (read via `subscribed_symbols`) |
+| `_counter_lock` | `_messages_parsed`, `_parse_errors`, `_callback_errors` | IO thread (write), any thread (read via `stats()`) |
 
-### 7. Lock-Free Hot Path
+### Dispatcher
 
-**Contract**: No explicit locks in the critical path (MQTT callback → parse → normalize → push).
+No locks. Relies on CPython GIL for atomic `deque` operations and single-writer
+counter semantics.
 
-**Guarantee**: Lower latency, no lock contention.
+### Feed Health Monitor
 
-**Trade-off**: CPython-only, SPSC-only.
-
----
-
-## CPython GIL Assumptions
-
-### What We Rely On
-
-1. `deque.append()` is atomic
-2. `deque.popleft()` is atomic
-3. `int` reads and writes are atomic (single bytecode instruction)
-
-### What This Means
-
-**Safe**:
-```python
-self._total_pushed += 1  # Atomic (single bytecode: INPLACE_ADD)
-self._queue.append(event)  # Atomic
-event = self._queue.popleft()  # Atomic
-```
-
-**NOT Safe Without GIL**:
-- Multi-producer (multiple threads calling `push()`)
-- Multi-consumer (multiple threads calling `poll()`)
+No locks. **NOT thread-safe.** Must be called from the strategy thread only.
 
 ---
 
-## Migration to Other Python Implementations
+## Concurrent Push/Poll Safety
 
-If migrating to PyPy, GraalPy, or nogil Python, replace with `threading.Queue`:
+The dispatcher's `push()` and `poll()` are safe to call concurrently from
+different threads because:
+
+1. `push()` only calls `deque.append()` (atomic) and writes `_total_pushed`
+   and `_total_dropped` (single-writer).
+2. `poll()` only calls `deque.popleft()` (atomic) and writes `_total_polled`
+   (single-writer).
+3. No counter is written by both threads.
+
+This is tested by the thread safety and stress tests in `test_dispatcher.py`.
+
+---
+
+## Reconnect Serialization
+
+The reconnect loop is serialized by the `_reconnecting` flag protected by
+`_reconnect_lock`. This prevents duplicate reconnect threads when multiple
+disconnect events or token refresh timers fire concurrently.
 
 ```python
-import queue
-
-class ThreadSafeDispatcher:
-    def __init__(self, maxlen: int):
-        self._queue = queue.Queue(maxsize=maxlen)
-    
-    def push(self, event: T) -> None:
-        try:
-            self._queue.put_nowait(event)
-            self._total_pushed += 1
-        except queue.Full:
-            # Drop oldest
-            _ = self._queue.get_nowait()
-            self._queue.put_nowait(event)
-            self._total_pushed += 1
-            self._total_dropped += 1
-    
-    def poll(self, max_events: int) -> list[T]:
-        result = []
-        for _ in range(max_events):
-            try:
-                result.append(self._queue.get_nowait())
-            except queue.Empty:
-                break
-        self._total_polled += len(result)
-        return result
+with self._reconnect_lock:
+    if self._reconnecting:
+        return              # Already reconnecting
+    self._reconnecting = True
 ```
 
----
-
-## Testing Strategies
-
-### Concurrent Testing Example
+The flag is cleared in a `finally` block to guarantee cleanup:
 
 ```python
-from concurrent.futures import ThreadPoolExecutor
-
-def test_concurrent_push_poll():
-    dispatcher = Dispatcher(maxlen=1000)
-    
-    def push_worker():
-        for i in range(1000):
-            dispatcher.push(i)
-    
-    def poll_worker():
-        total = []
-        while len(total) < 1000:
-            total.extend(dispatcher.poll(max_events=10))
-        return total
-    
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        push_future = executor.submit(push_worker)
-        poll_future = executor.submit(poll_worker)
-        
-        push_future.result()
-        result = poll_future.result()
-    
-    # All events received
-    assert len(result) == 1000
-    
-    # FIFO ordering may not be perfect due to race conditions
-    # but no data corruption
+finally:
+    with self._reconnect_lock:
+        self._reconnecting = False
 ```
 
 ---
 
-## Known Limitations
+## Generation-Based Stale Event Rejection
 
-### 1. SPSC Only
+Each call to `_create_mqtt_client()` increments `_client_generation`. The
+`on_message` callback captures the generation at bind time via a closure:
 
-**Limitation**: Multi-producer or multi-consumer violates safety guarantees.
+```python
+client.on_message = lambda c, u, m: self._on_message(
+    client=c, userdata=u, msg=m, generation=generation,
+)
+```
 
-**Solution**: Use `threading.Queue` for MPMC.
+In `_on_message`, messages from old generations are silently dropped:
 
-### 2. CPython Only
+```python
+if generation != self._client_generation:
+    return
+```
 
-**Limitation**: Relies on CPython GIL for atomicity.
-
-**Solution**: Add explicit locks for other Python implementations.
-
-### 3. Eventually Consistent Stats
-
-**Limitation**: `stats()` reads may reflect different points in time.
-
-**Solution**: Only read stats during quiescent periods for exactness.
+This prevents stale callbacks from a previous paho-mqtt client instance from
+dispatching events after a reconnect has created a new client.
 
 ---
 
-## Next Steps
+## Shutdown Safety
 
-- **[Invariants Defined by Tests](./invariants_defined_by_tests.md)** — All design guarantees
-- **[Failure Scenarios](./failure_scenarios.md)** — Error handling coverage
-- **[Threading and Concurrency](../01_system_overview/threading_and_concurrency.md)** — Architecture details
+`shutdown()` is safe to call from any thread and is idempotent:
+
+1. Sets state to `SHUTDOWN` under `_state_lock` (prevents reconnect).
+2. Signals `_shutdown_event` (stops background threads).
+3. Stops MQTT IO loop and disconnects.
+
+The `_shutdown_event` is checked in:
+
+- `_reconnect_loop` -- exits the retry loop
+- `_token_refresh_check` -- exits the monitoring loop
+
+---
+
+## What Is NOT Thread-Safe
+
+- `FeedHealthMonitor` -- all methods must be called from the strategy thread
+- `Dispatcher.clear()` -- must not be called concurrently with `push()` or `poll()`
+- `BidOfferAdapter.subscribe()` / `unsubscribe()` -- main thread only
+
+---
+
+## Related Pages
+
+- [Invariants Defined by Tests](./invariants_defined_by_tests.md) -- tested guarantees
+- [Failure Scenarios](./failure_scenarios.md) -- error handling under concurrency
